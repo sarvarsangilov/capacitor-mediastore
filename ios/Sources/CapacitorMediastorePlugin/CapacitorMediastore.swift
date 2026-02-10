@@ -74,7 +74,7 @@ import UIKit
             subtype: .any,
             options: nil
         )
-        appendAlbums(from: smartAlbums, to: &albums)
+        albums.append(contentsOf: collectAlbums(from: smartAlbums))
 
         // Пользовательские альбомы
         let userAlbums = PHAssetCollection.fetchAssetCollections(
@@ -82,18 +82,18 @@ import UIKit
             subtype: .any,
             options: nil
         )
-        appendAlbums(from: userAlbums, to: &albums)
+        albums.append(contentsOf: collectAlbums(from: userAlbums))
 
         return albums
     }
 
     /**
-     * Проходит по результатам fetch и добавляет альбомы с ненулевым количеством.
+     * Проходит по результатам fetch и возвращает альбомы с ненулевым количеством.
      */
-    private func appendAlbums(
-        from fetchResult: PHFetchResult<PHAssetCollection>,
-        to albums: inout [[String: Any]]
-    ) {
+    private func collectAlbums(
+        from fetchResult: PHFetchResult<PHAssetCollection>
+    ) -> [[String: Any]] {
+        var result: [[String: Any]] = []
         let fetchOptions = PHFetchOptions()
         fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
 
@@ -113,8 +113,9 @@ import UIKit
                 "count": count,
                 "coverUri": coverUri
             ]
-            albums.append(album)
+            result.append(album)
         }
+        return result
     }
 
     // MARK: - Media
