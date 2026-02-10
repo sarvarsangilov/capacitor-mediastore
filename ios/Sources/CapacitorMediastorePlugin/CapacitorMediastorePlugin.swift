@@ -23,12 +23,12 @@ public class CapacitorMediastorePlugin: CAPPlugin, CAPBridgedPlugin {
 
     // MARK: - Permissions
 
-    @objc func checkPermissions(_ call: CAPPluginCall) {
+    @objc override public func checkPermissions(_ call: CAPPluginCall) {
         let result = implementation.checkPermissions()
         call.resolve(result)
     }
 
-    @objc func requestPermissions(_ call: CAPPluginCall) {
+    @objc override public func requestPermissions(_ call: CAPPluginCall) {
         implementation.requestPermissions { result in
             call.resolve(result)
         }
