@@ -147,7 +147,14 @@
         {
           "name": "coverWebPath",
           "tags": [],
-          "docs": "URL обложки, пригодный для использования в <img src> внутри WebView",
+          "docs": "URL обложки, пригодный для использования в <img src> внутри WebView (оригинал)",
+          "complexTypes": [],
+          "type": "string | null"
+        },
+        {
+          "name": "coverThumbnailWebPath",
+          "tags": [],
+          "docs": "URL миниатюры обложки (кэшированный файл ~300px), высокопроизводительный, для списков",
           "complexTypes": [],
           "type": "string | null"
         }
@@ -224,6 +231,13 @@
           "name": "thumbnailUri",
           "tags": [],
           "docs": "URI / base64 миниатюры (может быть null, если не удалось получить)",
+          "complexTypes": [],
+          "type": "string | null"
+        },
+        {
+          "name": "thumbnailWebPath",
+          "tags": [],
+          "docs": "URL миниатюры (кэшированный файл ~300px), высокопроизводительный, для списков",
           "complexTypes": [],
           "type": "string | null"
         },

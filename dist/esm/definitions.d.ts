@@ -26,8 +26,10 @@ export interface Album {
     count: number;
     /** URI / путь обложки альбома (нативный идентификатор). Может быть `null`. */
     coverUri: string | null;
-    /** URL обложки, пригодный для использования в <img src> внутри WebView */
+    /** URL обложки, пригодный для использования в <img src> внутри WebView (оригинал) */
     coverWebPath: string | null;
+    /** URL миниатюры обложки (кэшированный файл ~300px), высокопроизводительный, для списков */
+    coverThumbnailWebPath: string | null;
 }
 export interface GetAlbumsResult {
     albums: Album[];
@@ -48,6 +50,8 @@ export interface MediaItem {
     webPath: string | null;
     /** URI / base64 миниатюры (может быть null, если не удалось получить) */
     thumbnailUri: string | null;
+    /** URL миниатюры (кэшированный файл ~300px), высокопроизводительный, для списков */
+    thumbnailWebPath: string | null;
     /** Ширина в пикселях */
     width: number;
     /** Высота в пикселях */

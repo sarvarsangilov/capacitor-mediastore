@@ -141,27 +141,45 @@ import UIKit
 
                 var coverUri: String? = nil
                 var coverWebPath: String? = nil
+                var coverThumbnailWebPath: String? = nil
                 
                 let innerGroup = DispatchGroup()
                 
                 if let firstAsset = assets.firstObject {
                     coverUri = "ph://\(firstAsset.localIdentifier)"
-                    // Резолвим webPath для обложки
+                    
+                    // Резолвим webPath (оригинал)
                     innerGroup.enter()
                     self.resolveWebPath(for: firstAsset) { path in
                         coverWebPath = path
                         innerGroup.leave()
                     }
+                    
+                    // Резолвим thumbnail (синхронно, так как options.isSynchronous = true)
+                    let imageManager = PHCachingImageManager()
+                    let thumbOptions = PHImageRequestOptions()
+                    thumbOptions.isSynchronous = true
+                    thumbOptions.resizeMode = .fast
+                    thumbOptions.deliveryMode = .fastFormat
+                    let thumbSize = CGSize(width: 300, height: 300)
+                    
+                    coverThumbnailWebPath = self.getOrCreateThumbnailFile(
+                        asset: firstAsset,
+                        imageManager: imageManager,
+                        options: thumbOptions,
+                        targetSize: thumbSize
+                    )
                 }
 
-                innerGroup.wait() // Ждем резолва внутри async блока
+                innerGroup.wait() // Ждем резолва оригинального пути
                 
                 let album: [String: Any] = [
                     "id": collection.localIdentifier,
                     "title": collection.localizedTitle ?? "Untitled",
                     "count": count,
                     "coverUri": coverUri ?? NSNull(),
-                    "coverWebPath": coverWebPath ?? NSNull()
+                    "coverWebPath": coverWebPath ?? NSNull(),
+                    "coverThumbnailWebPath": coverThumbnailWebPath ?? NSNull()
                 ]
                 
                 queue.async(flags: .barrier) {
@@ -315,17 +333,8 @@ import UIKit
             createdAt = ""
         }
 
-        var thumbnailBase64: Any = NSNull()
-        imageManager.requestImage(
-            for: asset,
-            targetSize: thumbSize,
-            contentMode: .aspectFill,
-            options: thumbOptions
-        ) { image, _ in
-            if let img = image, let data = img.jpegData(compressionQuality: 0.6) {
-                thumbnailBase64 = "data:image/jpeg;base64,\(data.base64EncodedString())"
-            }
-        }
+        // Вместо base64 сохраняем файл
+        let thumbnailWebPath = self.getOrCreateThumbnailFile(asset: asset, imageManager: imageManager, options: thumbOptions, targetSize: thumbSize)
 
         var fileName = ""
         var fileSize: Int64 = 0
@@ -344,7 +353,8 @@ import UIKit
             "id": asset.localIdentifier,
             "type": mediaType,
             "uri": uri,
-            "thumbnailUri": thumbnailBase64,
+            "thumbnailUri": thumbnailWebPath ?? NSNull(), // Оставляем совместимость, но теперь это путь
+            "thumbnailWebPath": thumbnailWebPath ?? NSNull(),
             "width": asset.pixelWidth,
             "height": asset.pixelHeight,
             "createdAt": createdAt,
@@ -353,6 +363,46 @@ import UIKit
             "fileSize": fileSize,
             "fileName": fileName
         ]
+    }
+    
+    /**
+     * Генерирует или возвращает путь к миниатюре во временной папке.
+     */
+    private func getOrCreateThumbnailFile(
+        asset: PHAsset,
+        imageManager: PHImageManager,
+        options: PHImageRequestOptions,
+        targetSize: CGSize
+    ) -> String? {
+        // Очищаем ID от символов, недопустимых в именах файлов (например, слэшей)
+        let safeId = asset.localIdentifier.replacingOccurrences(of: "/", with: "_")
+        let filename = "thumb_\(safeId).jpg"
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
+        
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            return "capacitor://localhost/_capacitor_file_" + fileURL.path
+        }
+        
+        var resultPath: String? = nil
+        
+        // Синхронный запрос (options.isSynchronous = true)
+        imageManager.requestImage(
+            for: asset,
+            targetSize: targetSize,
+            contentMode: .aspectFill,
+            options: options
+        ) { image, _ in
+            if let img = image, let data = img.jpegData(compressionQuality: 0.7) {
+                do {
+                    try data.write(to: fileURL)
+                    resultPath = "capacitor://localhost/_capacitor_file_" + fileURL.path
+                } catch {
+                    print("Error saving thumbnail: \(error)")
+                }
+            }
+        }
+        
+        return resultPath
     }
     
     private func resolveWebPath(for asset: PHAsset, completion: @escaping (String?) -> Void) {

@@ -2,12 +2,17 @@ package com.sangulov.plugins.mediastore
 
 import android.content.ContentResolver
 import android.content.ContentUris
+import android.content.Context
 import android.database.Cursor
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import android.util.Size
 import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
+import java.io.File
+import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -19,7 +24,9 @@ import java.util.TimeZone
  * Использует ContentResolver + MediaStore API для получения альбомов и медиафайлов.
  * Спроектирован с учётом производительности (Projection, LIMIT/OFFSET).
  */
-class MediaGallery(private val contentResolver: ContentResolver) {
+class MediaGallery(private val context: Context) {
+
+    private val contentResolver: ContentResolver = context.contentResolver
 
     companion object {
         private val isoFormat: SimpleDateFormat
@@ -60,6 +67,15 @@ class MediaGallery(private val contentResolver: ContentResolver) {
             obj.put("count", info.count)
             obj.put("coverUri", info.coverUri)
             obj.put("coverWebPath", info.coverUri?.let { contentUriToWebPath(it) })
+            
+            // Генерация thumbnail для обложки
+            val thumbPath = if (info.coverUri != null && info.coverId != null) {
+                 getOrCreateThumbnail(info.coverId, info.coverUri, info.coverIsVideo)
+            } else {
+                null
+            }
+            obj.put("coverThumbnailWebPath", thumbPath)
+            
             arr.put(obj)
         }
         result.put("albums", arr)
@@ -97,7 +113,9 @@ class MediaGallery(private val contentResolver: ContentResolver) {
                         id = bucketId,
                         title = bucketName,
                         count = 0,
-                        coverUri = coverUri
+                        coverUri = coverUri,
+                        coverId = mediaId,
+                        coverIsVideo = isVideo
                     )
                 }
                 info.count++
@@ -230,16 +248,18 @@ class MediaGallery(private val contentResolver: ContentResolver) {
         }
 
         val contentUri = ContentUris.withAppendedId(collection, id).toString()
-        val thumbnailUri = contentUri // На Android 10+ content URI работает как thumbnail source
-
         val createdAt = isoFormat.format(Date(dateAdded * 1000))
+
+        // Генерация/получение URL миниатюры
+        val thumbnailWebPath = getOrCreateThumbnail(id, contentUri, mediaType == "video")
 
         return JSObject().apply {
             put("id", id.toString())
             put("type", mediaType)
             put("uri", contentUri)
             put("webPath", contentUriToWebPath(contentUri))
-            put("thumbnailUri", thumbnailUri)
+            put("thumbnailUri", contentUri) // Оставляем совместимость
+            put("thumbnailWebPath", thumbnailWebPath)
             put("width", width)
             put("height", height)
             put("createdAt", createdAt)
@@ -254,7 +274,6 @@ class MediaGallery(private val contentResolver: ContentResolver) {
 
     /**
      * Конвертирует content:// URI в путь, понятный Capacitor WebView.
-     * content://media/external/images/media/123 -> http://localhost/_capacitor_content_/media/external/images/media/123
      */
     private fun contentUriToWebPath(contentUri: String): String {
         return if (contentUri.startsWith("content://")) {
@@ -263,6 +282,63 @@ class MediaGallery(private val contentResolver: ContentResolver) {
         } else {
             contentUri
         }
+    }
+
+    /**
+     * Создает или возвращает закэшированную миниатюру.
+     */
+    private fun getOrCreateThumbnail(mediaId: Long, contentUriStr: String, isVideo: Boolean): String? {
+        val cacheDir = context.cacheDir
+        val thumbFile = File(cacheDir, "thumb_$mediaId.jpg")
+
+        // Если файл уже есть, возвращаем путь
+        if (thumbFile.exists()) {
+             return "http://localhost/_capacitor_file_" + thumbFile.absolutePath
+        }
+
+        try {
+            val contentUri = Uri.parse(contentUriStr)
+            var bitmap: Bitmap? = null
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                try {
+                    bitmap = contentResolver.loadThumbnail(contentUri, Size(300, 300), null)
+                } catch (e: Exception) {
+                    // Fallback handled below
+                }
+            }
+            
+            if (bitmap == null) {
+                // Fallback for older APIs or if loadThumbnail fail
+                if (isVideo) {
+                    @Suppress("DEPRECATION")
+                    bitmap = MediaStore.Video.Thumbnails.getThumbnail(
+                        contentResolver,
+                        mediaId,
+                        MediaStore.Video.Thumbnails.MINI_KIND,
+                        null
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    bitmap = MediaStore.Images.Thumbnails.getThumbnail(
+                        contentResolver,
+                        mediaId,
+                        MediaStore.Images.Thumbnails.MINI_KIND,
+                        null
+                    )
+                }
+            }
+
+            if (bitmap != null) {
+                FileOutputStream(thumbFile).use { out ->
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 70, out)
+                }
+                return "http://localhost/_capacitor_file_" + thumbFile.absolutePath
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return null
     }
 
     private fun Cursor.getStringOrNull(columnName: String): String? {
@@ -286,7 +362,9 @@ class MediaGallery(private val contentResolver: ContentResolver) {
         val id: String,
         val title: String,
         var count: Int,
-        val coverUri: String?
+        val coverUri: String?,
+        val coverId: Long?,
+        val coverIsVideo: Boolean
     )
 
     private data class CollectionInfo(

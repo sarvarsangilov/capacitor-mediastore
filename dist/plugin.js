@@ -27,6 +27,7 @@ var capacitorCapacitorMediastore = (function (exports, core) {
             count: 128,
             coverUri: 'https://picsum.photos/seed/cover_all/200/200',
             coverWebPath: 'https://picsum.photos/seed/cover_all/200/200',
+            coverThumbnailWebPath: 'https://picsum.photos/seed/cover_all/200/200',
         },
         {
             id: 'camera',
@@ -34,6 +35,7 @@ var capacitorCapacitorMediastore = (function (exports, core) {
             count: 85,
             coverUri: 'https://picsum.photos/seed/cover_camera/200/200',
             coverWebPath: 'https://picsum.photos/seed/cover_camera/200/200',
+            coverThumbnailWebPath: 'https://picsum.photos/seed/cover_camera/200/200',
         },
         {
             id: 'screenshots',
@@ -41,6 +43,7 @@ var capacitorCapacitorMediastore = (function (exports, core) {
             count: 23,
             coverUri: 'https://picsum.photos/seed/cover_screenshots/200/200',
             coverWebPath: 'https://picsum.photos/seed/cover_screenshots/200/200',
+            coverThumbnailWebPath: 'https://picsum.photos/seed/cover_screenshots/200/200',
         },
         {
             id: 'downloads',
@@ -48,6 +51,7 @@ var capacitorCapacitorMediastore = (function (exports, core) {
             count: 12,
             coverUri: 'https://picsum.photos/seed/cover_downloads/200/200',
             coverWebPath: 'https://picsum.photos/seed/cover_downloads/200/200',
+            coverThumbnailWebPath: 'https://picsum.photos/seed/cover_downloads/200/200',
         },
         {
             id: 'favorites',
@@ -55,6 +59,7 @@ var capacitorCapacitorMediastore = (function (exports, core) {
             count: 8,
             coverUri: 'https://picsum.photos/seed/cover_favorites/200/200',
             coverWebPath: 'https://picsum.photos/seed/cover_favorites/200/200',
+            coverThumbnailWebPath: 'https://picsum.photos/seed/cover_favorites/200/200',
         },
     ];
     /**
@@ -73,6 +78,7 @@ var capacitorCapacitorMediastore = (function (exports, core) {
                 uri: imgUri,
                 webPath: imgUri, // на вебе webPath === uri
                 thumbnailUri: `https://picsum.photos/seed/thumb${i}/200/200`,
+                thumbnailWebPath: `https://picsum.photos/seed/thumb${i}/200/200`,
                 width: isVideo ? 1920 : 1080,
                 height: isVideo ? 1080 : 1920,
                 createdAt: fakeDate(i),

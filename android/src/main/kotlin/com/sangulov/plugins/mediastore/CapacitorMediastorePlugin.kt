@@ -45,7 +45,7 @@ class CapacitorMediastorePlugin : Plugin() {
 
     override fun load() {
         super.load()
-        mediaGallery = MediaGallery(context.contentResolver)
+        mediaGallery = MediaGallery(context)
     }
 
     // ────────────────────────────────────────────────────────────────────────

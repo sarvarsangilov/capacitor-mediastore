@@ -21,6 +21,7 @@ const MOCK_ALBUMS = [
         count: 128,
         coverUri: 'https://picsum.photos/seed/cover_all/200/200',
         coverWebPath: 'https://picsum.photos/seed/cover_all/200/200',
+        coverThumbnailWebPath: 'https://picsum.photos/seed/cover_all/200/200',
     },
     {
         id: 'camera',
@@ -28,6 +29,7 @@ const MOCK_ALBUMS = [
         count: 85,
         coverUri: 'https://picsum.photos/seed/cover_camera/200/200',
         coverWebPath: 'https://picsum.photos/seed/cover_camera/200/200',
+        coverThumbnailWebPath: 'https://picsum.photos/seed/cover_camera/200/200',
     },
     {
         id: 'screenshots',
@@ -35,6 +37,7 @@ const MOCK_ALBUMS = [
         count: 23,
         coverUri: 'https://picsum.photos/seed/cover_screenshots/200/200',
         coverWebPath: 'https://picsum.photos/seed/cover_screenshots/200/200',
+        coverThumbnailWebPath: 'https://picsum.photos/seed/cover_screenshots/200/200',
     },
     {
         id: 'downloads',
@@ -42,6 +45,7 @@ const MOCK_ALBUMS = [
         count: 12,
         coverUri: 'https://picsum.photos/seed/cover_downloads/200/200',
         coverWebPath: 'https://picsum.photos/seed/cover_downloads/200/200',
+        coverThumbnailWebPath: 'https://picsum.photos/seed/cover_downloads/200/200',
     },
     {
         id: 'favorites',
@@ -49,6 +53,7 @@ const MOCK_ALBUMS = [
         count: 8,
         coverUri: 'https://picsum.photos/seed/cover_favorites/200/200',
         coverWebPath: 'https://picsum.photos/seed/cover_favorites/200/200',
+        coverThumbnailWebPath: 'https://picsum.photos/seed/cover_favorites/200/200',
     },
 ];
 /**
@@ -67,6 +72,7 @@ function generateMockMedia(count) {
             uri: imgUri,
             webPath: imgUri, // на вебе webPath === uri
             thumbnailUri: `https://picsum.photos/seed/thumb${i}/200/200`,
+            thumbnailWebPath: `https://picsum.photos/seed/thumb${i}/200/200`,
             width: isVideo ? 1920 : 1080,
             height: isVideo ? 1080 : 1920,
             createdAt: fakeDate(i),
