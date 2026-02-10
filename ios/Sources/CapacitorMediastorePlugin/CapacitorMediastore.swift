@@ -65,57 +65,122 @@ import UIKit
     /**
      * Возвращает список альбомов с подсчётом и обложкой.
      */
-    @objc public func getAlbums() -> [[String: Any]] {
-        var albums: [[String: Any]] = []
+    /**
+     * Возвращает список альбомов с подсчётом и обложкой.
+     */
+    @objc public func getAlbums(completion: @escaping ([[String: Any]]) -> Void) {
+        let group = DispatchGroup()
+        var allAlbums: [[String: Any]] = []
+        let queue = DispatchQueue(label: "com.sangulov.plugins.mediastore.albums", attributes: .concurrent)
 
-        // Смарт-альбомы (Camera Roll, Favorites, Screenshots и т.д.)
+        // Смарт-альбомы
+        group.enter()
         let smartAlbums = PHAssetCollection.fetchAssetCollections(
             with: .smartAlbum,
             subtype: .any,
             options: nil
         )
-        albums.append(contentsOf: collectAlbums(from: smartAlbums))
+        self.collectAlbums(from: smartAlbums) { albums in
+            queue.async(flags: .barrier) {
+                allAlbums.append(contentsOf: albums)
+            }
+            group.leave()
+        }
 
         // Пользовательские альбомы
+        group.enter()
         let userAlbums = PHAssetCollection.fetchAssetCollections(
             with: .album,
             subtype: .any,
             options: nil
         )
-        albums.append(contentsOf: collectAlbums(from: userAlbums))
+        self.collectAlbums(from: userAlbums) { albums in
+            queue.async(flags: .barrier) {
+                allAlbums.append(contentsOf: albums)
+            }
+            group.leave()
+        }
 
-        return albums
+        group.notify(queue: .main) {
+            completion(allAlbums)
+        }
     }
 
     /**
-     * Проходит по результатам fetch и возвращает альбомы с ненулевым количеством.
+     * Проходит по результатам fetch и возвращает альбомы с ненулевым количеством (асинхронно).
      */
     private func collectAlbums(
-        from fetchResult: PHFetchResult<PHAssetCollection>
-    ) -> [[String: Any]] {
-        var result: [[String: Any]] = []
+        from fetchResult: PHFetchResult<PHAssetCollection>,
+        completion: @escaping ([[String: Any]]) -> Void
+    ) {
         let fetchOptions = PHFetchOptions()
         fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
 
-        fetchResult.enumerateObjects { collection, _, _ in
-            let assets = PHAsset.fetchAssets(in: collection, options: fetchOptions)
-            let count = assets.count
-            guard count > 0 else { return }
-
-            var coverUri: Any = NSNull()
-            if let firstAsset = assets.firstObject {
-                coverUri = "ph://\(firstAsset.localIdentifier)"
-            }
-
-            let album: [String: Any] = [
-                "id": collection.localIdentifier,
-                "title": collection.localizedTitle ?? "Untitled",
-                "count": count,
-                "coverUri": coverUri
-            ]
-            result.append(album)
+        var albums: [Int: [String: Any]] = [:]
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "com.sangulov.plugins.mediastore.collect", attributes: .concurrent)
+        
+        // Массив индексов, чтобы итерироваться
+        let count = fetchResult.count
+        guard count > 0 else {
+            completion([])
+            return
         }
-        return result
+
+        for i in 0..<count {
+            let collection = fetchResult.object(at: i)
+            group.enter()
+            
+            queue.async {
+                let assets = PHAsset.fetchAssets(in: collection, options: fetchOptions)
+                let count = assets.count
+                guard count > 0 else {
+                    group.leave()
+                    return
+                }
+
+                var coverUri: String? = nil
+                var coverWebPath: String? = nil
+                
+                let innerGroup = DispatchGroup()
+                
+                if let firstAsset = assets.firstObject {
+                    coverUri = "ph://\(firstAsset.localIdentifier)"
+                    // Резолвим webPath для обложки
+                    innerGroup.enter()
+                    self.resolveWebPath(for: firstAsset) { path in
+                        coverWebPath = path
+                        innerGroup.leave()
+                    }
+                }
+
+                innerGroup.wait() // Ждем резолва внутри async блока
+                
+                let album: [String: Any] = [
+                    "id": collection.localIdentifier,
+                    "title": collection.localizedTitle ?? "Untitled",
+                    "count": count,
+                    "coverUri": coverUri ?? NSNull(),
+                    "coverWebPath": coverWebPath ?? NSNull()
+                ]
+                
+                queue.async(flags: .barrier) {
+                    albums[i] = album
+                }
+                group.leave()
+            }
+        }
+        
+        group.notify(queue: .global(qos: .userInitiated)) {
+             // Собираем результаты
+             var result: [[String: Any]] = []
+             for i in 0..<count {
+                 if let album = albums[i] {
+                     result.append(album)
+                 }
+             }
+             completion(result)
+        }
     }
 
     // MARK: - Media
@@ -130,6 +195,9 @@ import UIKit
      *   - type: "photo", "video" или "all".
      *   - completion: Вызывается с результатом (основной поток не гарантирован).
      */
+    /**
+     * Возвращает медиафайлы с метаданными и путями.
+     */
     @objc public func getMedia(
         albumId: String?,
         limit: Int,
@@ -140,7 +208,6 @@ import UIKit
         let fetchOptions = PHFetchOptions()
         fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
 
-        // Фильтр по типу
         switch type {
         case "photo":
             fetchOptions.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
@@ -154,7 +221,6 @@ import UIKit
             )
         }
 
-        // Fetch
         let fetchResult: PHFetchResult<PHAsset>
         if let albumId = albumId, !albumId.isEmpty {
             let collections = PHAssetCollection.fetchAssetCollections(
@@ -181,11 +247,13 @@ import UIKit
             return
         }
 
-        let range = NSRange(location: safeOffset, length: safeLimit)
-        let indexSet = IndexSet(integersIn: Range(range)!)
-        var items: [[String: Any]] = []
+        var items: [Int: [String: Any]] = [:] // Dictionary for thread-safe writing by index
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "com.sangulov.plugins.mediastore.processing", attributes: .concurrent)
 
-        // Получаем миниатюры синхронно (targetSize маленький)
+        let range = safeOffset..<(safeOffset + safeLimit)
+        
+        // Пре-феч миниатюр
         let imageManager = PHCachingImageManager()
         let thumbOptions = PHImageRequestOptions()
         thumbOptions.isSynchronous = true
@@ -193,75 +261,132 @@ import UIKit
         thumbOptions.resizeMode = .fast
         let thumbSize = CGSize(width: 200, height: 200)
 
-        fetchResult.enumerateObjects(at: indexSet, options: []) { asset, _, _ in
-            let mediaType: String = asset.mediaType == .video ? "video" : "photo"
-            let uri = "ph://\(asset.localIdentifier)"
-
-            // ISO дата
-            let createdAt: String
-            if let date = asset.creationDate {
-                let formatter = ISO8601DateFormatter()
-                formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                createdAt = formatter.string(from: date)
-            } else {
-                createdAt = ""
-            }
-
-            // Миниатюра как base64
-            var thumbnailBase64: Any = NSNull()
-            imageManager.requestImage(
-                for: asset,
-                targetSize: thumbSize,
-                contentMode: .aspectFill,
-                options: thumbOptions
-            ) { image, _ in
-                if let img = image, let data = img.jpegData(compressionQuality: 0.6) {
-                    thumbnailBase64 = "data:image/jpeg;base64,\(data.base64EncodedString())"
+        for i in range {
+            guard i < fetchResult.count else { break }
+            let asset = fetchResult.object(at: i)
+            let index = i - safeOffset
+            
+            group.enter()
+            
+            // Базовая инфо и миниатюра (синхронно)
+            var item = self.assetToItem(asset: asset, imageManager: imageManager, thumbOptions: thumbOptions, thumbSize: thumbSize)
+            
+            // Получение webPath (асинхронно)
+            self.resolveWebPath(for: asset) { webPath in
+                item["webPath"] = webPath
+                queue.async(flags: .barrier) {
+                    items[index] = item
                 }
+                group.leave()
             }
-
-            // Получаем имя файла
-            let fileName: String
-            let resources = PHAssetResource.assetResources(for: asset)
-            if let primaryResource = resources.first {
-                fileName = primaryResource.originalFilename
-            } else {
-                fileName = ""
-            }
-
-            // Размер файла (может быть 0 если недоступен)
-            var fileSize: Int64 = 0
-            if let resource = resources.first {
-                if let sizeValue = resource.value(forKey: "fileSize") as? Int64 {
-                    fileSize = sizeValue
-                }
-            }
-
-            // MIME
-            let mimeType: String
-            if let uti = resources.first?.uniformTypeIdentifier {
-                mimeType = self.mimeTypeFromUTI(uti)
-            } else {
-                mimeType = mediaType == "video" ? "video/mp4" : "image/jpeg"
-            }
-
-            let item: [String: Any] = [
-                "id": asset.localIdentifier,
-                "type": mediaType,
-                "uri": uri,
-                "thumbnailUri": thumbnailBase64,
-                "width": asset.pixelWidth,
-                "height": asset.pixelHeight,
-                "createdAt": createdAt,
-                "duration": asset.duration,
-                "mimeType": mimeType,
-                "fileSize": fileSize,
-                "fileName": fileName
-            ]
-            items.append(item)
         }
 
-        completion(["media": items, "total": total, "hasMore": hasMore])
+        group.notify(queue: .main) {
+            // Собираем массив в правильном порядке
+            var sortedItems: [[String: Any]] = []
+            for i in 0..<safeLimit {
+                if let item = items[i] {
+                    sortedItems.append(item)
+                }
+            }
+            completion(["media": sortedItems, "total": total, "hasMore": hasMore])
+        }
+    }
+    
+    // ────────────────────────────────────────────────────────────────────────
+    // Helpers Implementation
+    // ────────────────────────────────────────────────────────────────────────
+
+    private func assetToItem(
+        asset: PHAsset,
+        imageManager: PHImageManager,
+        thumbOptions: PHImageRequestOptions,
+        thumbSize: CGSize
+    ) -> [String: Any] {
+        let mediaType: String = asset.mediaType == .video ? "video" : "photo"
+        let uri = "ph://\(asset.localIdentifier)"
+
+        let createdAt: String
+        if let date = asset.creationDate {
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            createdAt = formatter.string(from: date)
+        } else {
+            createdAt = ""
+        }
+
+        var thumbnailBase64: Any = NSNull()
+        imageManager.requestImage(
+            for: asset,
+            targetSize: thumbSize,
+            contentMode: .aspectFill,
+            options: thumbOptions
+        ) { image, _ in
+            if let img = image, let data = img.jpegData(compressionQuality: 0.6) {
+                thumbnailBase64 = "data:image/jpeg;base64,\(data.base64EncodedString())"
+            }
+        }
+
+        var fileName = ""
+        var fileSize: Int64 = 0
+        var mimeType = mediaType == "video" ? "video/mp4" : "image/jpeg"
+        
+        let resources = PHAssetResource.assetResources(for: asset)
+        if let resource = resources.first {
+            fileName = resource.originalFilename
+            if let sizeValue = resource.value(forKey: "fileSize") as? Int64 {
+                fileSize = sizeValue
+            }
+            mimeType = self.mimeTypeFromUTI(resource.uniformTypeIdentifier)
+        }
+
+        return [
+            "id": asset.localIdentifier,
+            "type": mediaType,
+            "uri": uri,
+            "thumbnailUri": thumbnailBase64,
+            "width": asset.pixelWidth,
+            "height": asset.pixelHeight,
+            "createdAt": createdAt,
+            "duration": asset.duration,
+            "mimeType": mimeType,
+            "fileSize": fileSize,
+            "fileName": fileName
+        ]
+    }
+    
+    private func resolveWebPath(for asset: PHAsset, completion: @escaping (String?) -> Void) {
+        let options = PHContentEditingInputRequestOptions()
+        options.isNetworkAccessAllowed = true // разрешаем скачивание из iCloud
+
+        asset.requestContentEditingInput(with: options) { input, info in
+            guard let url = input?.fullSizeImageURL else {
+                // Для видео fallback
+                if asset.mediaType == .video {
+                   let videoOptions = PHVideoRequestOptions()
+                   videoOptions.isNetworkAccessAllowed = true
+                   PHImageManager.default().requestAVAsset(forVideo: asset, options: videoOptions) { avAsset, _, _ in
+                       if let urlAsset = avAsset as? AVURLAsset {
+                           completion(self.convertToCapacitorPath(url: urlAsset.url))
+                       } else {
+                           completion(nil)
+                       }
+                   }
+                   return
+                }
+                completion(nil)
+                return
+            }
+            completion(self.convertToCapacitorPath(url: url))
+        }
+    }
+    
+    private func convertToCapacitorPath(url: URL) -> String {
+        // На iOS Capacitor использует bridge для конвертации file:// URL
+        // Стандартный формат: capacitor://localhost/_capacitor_file_ + path
+        // Также нужно убедиться, что файл доступен. PHContentEditingInput дает URL, к которому 
+        // у приложения есть доступ на чтение.
+        return "capacitor://localhost/_capacitor_file_" + url.path
     }
 
     // MARK: - Helpers

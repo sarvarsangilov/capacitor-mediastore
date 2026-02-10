@@ -38,11 +38,8 @@ public class CapacitorMediastorePlugin: CAPPlugin, CAPBridgedPlugin {
 
     @objc func getAlbums(_ call: CAPPluginCall) {
         DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                let albums = self.implementation.getAlbums()
+            self.implementation.getAlbums { albums in
                 call.resolve(["albums": albums])
-            } catch {
-                call.reject("Failed to get albums: \(error.localizedDescription)")
             }
         }
     }

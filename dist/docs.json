@@ -140,7 +140,14 @@
         {
           "name": "coverUri",
           "tags": [],
-          "docs": "URI / путь обложки альбома (первый медиафайл). Может быть `null`.",
+          "docs": "URI / путь обложки альбома (нативный идентификатор). Может быть `null`.",
+          "complexTypes": [],
+          "type": "string | null"
+        },
+        {
+          "name": "coverWebPath",
+          "tags": [],
+          "docs": "URL обложки, пригодный для использования в <img src> внутри WebView",
           "complexTypes": [],
           "type": "string | null"
         }
@@ -202,9 +209,16 @@
         {
           "name": "uri",
           "tags": [],
-          "docs": "URI / путь к полноразмерному файлу",
+          "docs": "URI / путь к полноразмерному файлу (нативный идентификатор)",
           "complexTypes": [],
           "type": "string"
+        },
+        {
+          "name": "webPath",
+          "tags": [],
+          "docs": "URL, пригодный для использования в <img src> / <video src> внутри WebView.\nНа Android: http://localhost/_capacitor_content_/...\nНа iOS: capacitor://localhost/_capacitor_file_/tmp/...\nНа Web: совпадает с uri.",
+          "complexTypes": [],
+          "type": "string | null"
         },
         {
           "name": "thumbnailUri",

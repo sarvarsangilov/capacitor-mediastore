@@ -24,8 +24,10 @@ export interface Album {
     title: string;
     /** Количество медиафайлов в альбоме */
     count: number;
-    /** URI / путь обложки альбома (первый медиафайл). Может быть `null`. */
+    /** URI / путь обложки альбома (нативный идентификатор). Может быть `null`. */
     coverUri: string | null;
+    /** URL обложки, пригодный для использования в <img src> внутри WebView */
+    coverWebPath: string | null;
 }
 export interface GetAlbumsResult {
     albums: Album[];
@@ -35,8 +37,15 @@ export interface MediaItem {
     id: string;
     /** Тип: photo или video */
     type: 'photo' | 'video';
-    /** URI / путь к полноразмерному файлу */
+    /** URI / путь к полноразмерному файлу (нативный идентификатор) */
     uri: string;
+    /**
+     * URL, пригодный для использования в <img src> / <video src> внутри WebView.
+     * На Android: http://localhost/_capacitor_content_/...
+     * На iOS: capacitor://localhost/_capacitor_file_/tmp/...
+     * На Web: совпадает с uri.
+     */
+    webPath: string | null;
     /** URI / base64 миниатюры (может быть null, если не удалось получить) */
     thumbnailUri: string | null;
     /** Ширина в пикселях */

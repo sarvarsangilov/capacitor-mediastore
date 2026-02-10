@@ -101,12 +101,13 @@ getMedia(options: GetMediaOptions) => Promise<GetMediaResult>
 
 #### Album
 
-| Prop           | Type                        | Description                                                       |
-| -------------- | --------------------------- | ----------------------------------------------------------------- |
-| **`id`**       | <code>string</code>         | Уникальный идентификатор альбома                                  |
-| **`title`**    | <code>string</code>         | Название альбома                                                  |
-| **`count`**    | <code>number</code>         | Количество медиафайлов в альбоме                                  |
-| **`coverUri`** | <code>string \| null</code> | URI / путь обложки альбома (первый медиафайл). Может быть `null`. |
+| Prop               | Type                        | Description                                                               |
+| ------------------ | --------------------------- | ------------------------------------------------------------------------- |
+| **`id`**           | <code>string</code>         | Уникальный идентификатор альбома                                          |
+| **`title`**        | <code>string</code>         | Название альбома                                                          |
+| **`count`**        | <code>number</code>         | Количество медиафайлов в альбоме                                          |
+| **`coverUri`**     | <code>string \| null</code> | URI / путь обложки альбома (нативный идентификатор). Может быть `null`.   |
+| **`coverWebPath`** | <code>string \| null</code> | URL обложки, пригодный для использования в &lt;img src&gt; внутри WebView |
 
 
 #### GetMediaResult
@@ -120,19 +121,20 @@ getMedia(options: GetMediaOptions) => Promise<GetMediaResult>
 
 #### MediaItem
 
-| Prop               | Type                            | Description                                                        |
-| ------------------ | ------------------------------- | ------------------------------------------------------------------ |
-| **`id`**           | <code>string</code>             | Уникальный идентификатор медиафайла                                |
-| **`type`**         | <code>'photo' \| 'video'</code> | Тип: photo или video                                               |
-| **`uri`**          | <code>string</code>             | URI / путь к полноразмерному файлу                                 |
-| **`thumbnailUri`** | <code>string \| null</code>     | URI / base64 миниатюры (может быть null, если не удалось получить) |
-| **`width`**        | <code>number</code>             | Ширина в пикселях                                                  |
-| **`height`**       | <code>number</code>             | Высота в пикселях                                                  |
-| **`createdAt`**    | <code>string</code>             | Дата создания (ISO 8601 строка)                                    |
-| **`duration`**     | <code>number</code>             | Длительность в секундах (только для видео, 0 для фото)             |
-| **`mimeType`**     | <code>string</code>             | MIME-тип файла                                                     |
-| **`fileSize`**     | <code>number</code>             | Размер файла в байтах                                              |
-| **`fileName`**     | <code>string</code>             | Имя файла                                                          |
+| Prop               | Type                            | Description                                                                                                                                                                                                                 |
+| ------------------ | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`id`**           | <code>string</code>             | Уникальный идентификатор медиафайла                                                                                                                                                                                         |
+| **`type`**         | <code>'photo' \| 'video'</code> | Тип: photo или video                                                                                                                                                                                                        |
+| **`uri`**          | <code>string</code>             | URI / путь к полноразмерному файлу (нативный идентификатор)                                                                                                                                                                 |
+| **`webPath`**      | <code>string \| null</code>     | URL, пригодный для использования в &lt;img src&gt; / &lt;video src&gt; внутри WebView. На Android: http://localhost/_capacitor_content_/... На iOS: capacitor://localhost/_capacitor_file_/tmp/... На Web: совпадает с uri. |
+| **`thumbnailUri`** | <code>string \| null</code>     | URI / base64 миниатюры (может быть null, если не удалось получить)                                                                                                                                                          |
+| **`width`**        | <code>number</code>             | Ширина в пикселях                                                                                                                                                                                                           |
+| **`height`**       | <code>number</code>             | Высота в пикселях                                                                                                                                                                                                           |
+| **`createdAt`**    | <code>string</code>             | Дата создания (ISO 8601 строка)                                                                                                                                                                                             |
+| **`duration`**     | <code>number</code>             | Длительность в секундах (только для видео, 0 для фото)                                                                                                                                                                      |
+| **`mimeType`**     | <code>string</code>             | MIME-тип файла                                                                                                                                                                                                              |
+| **`fileSize`**     | <code>number</code>             | Размер файла в байтах                                                                                                                                                                                                       |
+| **`fileName`**     | <code>string</code>             | Имя файла                                                                                                                                                                                                                   |
 
 
 #### GetMediaOptions

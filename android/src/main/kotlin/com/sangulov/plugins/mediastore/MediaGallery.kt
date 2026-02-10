@@ -59,6 +59,7 @@ class MediaGallery(private val contentResolver: ContentResolver) {
             obj.put("title", info.title)
             obj.put("count", info.count)
             obj.put("coverUri", info.coverUri)
+            obj.put("coverWebPath", info.coverUri?.let { contentUriToWebPath(it) })
             arr.put(obj)
         }
         result.put("albums", arr)
@@ -237,6 +238,7 @@ class MediaGallery(private val contentResolver: ContentResolver) {
             put("id", id.toString())
             put("type", mediaType)
             put("uri", contentUri)
+            put("webPath", contentUriToWebPath(contentUri))
             put("thumbnailUri", thumbnailUri)
             put("width", width)
             put("height", height)
@@ -249,6 +251,19 @@ class MediaGallery(private val contentResolver: ContentResolver) {
     }
 
     // ── Helper extension functions ────────────────────────────────────────
+
+    /**
+     * Конвертирует content:// URI в путь, понятный Capacitor WebView.
+     * content://media/external/images/media/123 -> http://localhost/_capacitor_content_/media/external/images/media/123
+     */
+    private fun contentUriToWebPath(contentUri: String): String {
+        return if (contentUri.startsWith("content://")) {
+            val path = contentUri.removePrefix("content://")
+            "http://localhost/_capacitor_content_/$path"
+        } else {
+            contentUri
+        }
+    }
 
     private fun Cursor.getStringOrNull(columnName: String): String? {
         val idx = getColumnIndex(columnName)

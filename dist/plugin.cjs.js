@@ -22,11 +22,41 @@ function fakeDate(daysAgo) {
  * Набор фейковых альбомов для веб-среды.
  */
 const MOCK_ALBUMS = [
-    { id: 'all', title: 'All Photos', count: 128, coverUri: null },
-    { id: 'camera', title: 'Camera', count: 85, coverUri: null },
-    { id: 'screenshots', title: 'Screenshots', count: 23, coverUri: null },
-    { id: 'downloads', title: 'Downloads', count: 12, coverUri: null },
-    { id: 'favorites', title: 'Favorites', count: 8, coverUri: null },
+    {
+        id: 'all',
+        title: 'All Photos',
+        count: 128,
+        coverUri: 'https://picsum.photos/seed/cover_all/200/200',
+        coverWebPath: 'https://picsum.photos/seed/cover_all/200/200',
+    },
+    {
+        id: 'camera',
+        title: 'Camera',
+        count: 85,
+        coverUri: 'https://picsum.photos/seed/cover_camera/200/200',
+        coverWebPath: 'https://picsum.photos/seed/cover_camera/200/200',
+    },
+    {
+        id: 'screenshots',
+        title: 'Screenshots',
+        count: 23,
+        coverUri: 'https://picsum.photos/seed/cover_screenshots/200/200',
+        coverWebPath: 'https://picsum.photos/seed/cover_screenshots/200/200',
+    },
+    {
+        id: 'downloads',
+        title: 'Downloads',
+        count: 12,
+        coverUri: 'https://picsum.photos/seed/cover_downloads/200/200',
+        coverWebPath: 'https://picsum.photos/seed/cover_downloads/200/200',
+    },
+    {
+        id: 'favorites',
+        title: 'Favorites',
+        count: 8,
+        coverUri: 'https://picsum.photos/seed/cover_favorites/200/200',
+        coverWebPath: 'https://picsum.photos/seed/cover_favorites/200/200',
+    },
 ];
 /**
  * Генерирует массив фейковых медиафайлов.
@@ -35,12 +65,14 @@ function generateMockMedia(count) {
     const items = [];
     for (let i = 0; i < count; i++) {
         const isVideo = i % 5 === 0; // каждый 5-й элемент — видео
+        const imgUri = isVideo
+            ? `https://picsum.photos/seed/vid${i}/1920/1080`
+            : `https://picsum.photos/seed/img${i}/1080/1920`;
         items.push({
             id: `mock-media-${i}`,
             type: isVideo ? 'video' : 'photo',
-            uri: isVideo
-                ? `https://picsum.photos/seed/vid${i}/1920/1080`
-                : `https://picsum.photos/seed/img${i}/1080/1920`,
+            uri: imgUri,
+            webPath: imgUri, // на вебе webPath === uri
             thumbnailUri: `https://picsum.photos/seed/thumb${i}/200/200`,
             width: isVideo ? 1920 : 1080,
             height: isVideo ? 1080 : 1920,
