@@ -202,7 +202,7 @@ class MediaGallery(private val context: Context) {
         val selection = albumId?.let { "${MediaStore.MediaColumns.BUCKET_ID} = ?" }
         val selectionArgs = albumId?.let { arrayOf(it) }
         val projection = arrayOf(MediaStore.MediaColumns._ID)
-        contentResolver.query(collection, projection, selection, selectionArgs, null)?.use { return cursor.count }
+        contentResolver.query(collection, projection, selection, selectionArgs, null)?.use { return it.count }
         return 0
     }
 
