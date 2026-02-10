@@ -59,9 +59,9 @@ export interface MediaItem {
    * На Web: совпадает с uri.
    */
   webPath: string | null;
-  /** URI / base64 миниатюры (может быть null, если не удалось получить) */
+  /** URI / base64 миниатюры (в getMedia теперь возвращается null для производительности) */
   thumbnailUri: string | null;
-  /** URL миниатюры (кэшированный файл ~300px), высокопроизводительный, для списков */
+  /** URL миниатюры (в getMedia теперь возвращается null для производительности) */
   thumbnailWebPath: string | null;
   /** Ширина в пикселях */
   width: number;
@@ -98,6 +98,16 @@ export interface GetMediaResult {
   hasMore: boolean;
 }
 
+export interface GetThumbnailOptions {
+  /** ID медиафайла */
+  id: string;
+}
+
+export interface GetThumbnailResult {
+  /** Base64 строка изображения (с префиксом data:image/jpeg;base64,...) */
+  base64String: string;
+}
+
 // ─── Plugin Interface ────────────────────────────────────────────────────────
 
 export interface CapacitorMediastorePlugin {
@@ -117,7 +127,12 @@ export interface CapacitorMediastorePlugin {
   getAlbums(): Promise<GetAlbumsResult>;
 
   /**
-   * Возвращает список медиафайлов с метаданными, поддерживает пагинацию и фильтрацию.
+   * Возвращает список медиафайлов с метаданными (БЕЗ миниатюр).
    */
   getMedia(options: GetMediaOptions): Promise<GetMediaResult>;
+
+  /**
+   * Генерирует миниатюру для указанного медиафайла (Lazy Load).
+   */
+  getThumbnail(options: GetThumbnailOptions): Promise<GetThumbnailResult>;
 }

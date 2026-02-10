@@ -333,8 +333,8 @@ import UIKit
             createdAt = ""
         }
 
-        // Вместо base64 сохраняем файл
-        let thumbnailWebPath = self.getOrCreateThumbnailFile(asset: asset, imageManager: imageManager, options: thumbOptions, targetSize: thumbSize)
+        // Lazy Load: Thumbnail fields are null
+        let thumbnailWebPath: String? = nil
 
         var fileName = ""
         var fileSize: Int64 = 0
@@ -353,8 +353,8 @@ import UIKit
             "id": asset.localIdentifier,
             "type": mediaType,
             "uri": uri,
-            "thumbnailUri": thumbnailWebPath ?? NSNull(), // Оставляем совместимость, но теперь это путь
-            "thumbnailWebPath": thumbnailWebPath ?? NSNull(),
+            "thumbnailUri": NSNull(),
+            "thumbnailWebPath": NSNull(),
             "width": asset.pixelWidth,
             "height": asset.pixelHeight,
             "createdAt": createdAt,
@@ -363,6 +363,41 @@ import UIKit
             "fileSize": fileSize,
             "fileName": fileName
         ]
+    }
+    
+    /**
+     * Lazy Load thumbnail: returns Base64 string.
+     */
+    @objc public func getThumbnail(id: String, completion: @escaping ([String: Any]) -> Void) {
+        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil)
+        guard let asset = fetchResult.firstObject else {
+            completion(["base64String": ""])
+            return
+        }
+
+        let imageManager = PHCachingImageManager()
+        let options = PHImageRequestOptions()
+        options.isSynchronous = true // Важно: предотвращаем множественные вызовы completion (degraded -> high quality)
+        options.deliveryMode = .fastFormat
+        options.resizeMode = .fast
+        options.isNetworkAccessAllowed = true
+
+        let targetSize = CGSize(width: 256, height: 256)
+
+        imageManager.requestImage(
+            for: asset,
+            targetSize: targetSize,
+            contentMode: .aspectFill,
+            options: options
+        ) { image, info in
+            if let img = image,
+               let data = img.jpegData(compressionQuality: 0.6) {
+                let base64 = data.base64EncodedString()
+                completion(["base64String": "data:image/jpeg;base64,\(base64)"])
+            } else {
+                completion(["base64String": ""])
+            }
+        }
     }
     
     /**

@@ -53,12 +53,31 @@
         ],
         "returns": "Promise<GetMediaResult>",
         "tags": [],
-        "docs": "Возвращает список медиафайлов с метаданными, поддерживает пагинацию и фильтрацию.",
+        "docs": "Возвращает список медиафайлов с метаданными (БЕЗ миниатюр).",
         "complexTypes": [
           "GetMediaResult",
           "GetMediaOptions"
         ],
         "slug": "getmedia"
+      },
+      {
+        "name": "getThumbnail",
+        "signature": "(options: GetThumbnailOptions) => Promise<GetThumbnailResult>",
+        "parameters": [
+          {
+            "name": "options",
+            "docs": "",
+            "type": "GetThumbnailOptions"
+          }
+        ],
+        "returns": "Promise<GetThumbnailResult>",
+        "tags": [],
+        "docs": "Генерирует миниатюру для указанного медиафайла (Lazy Load).",
+        "complexTypes": [
+          "GetThumbnailResult",
+          "GetThumbnailOptions"
+        ],
+        "slug": "getthumbnail"
       }
     ],
     "properties": []
@@ -230,14 +249,14 @@
         {
           "name": "thumbnailUri",
           "tags": [],
-          "docs": "URI / base64 миниатюры (может быть null, если не удалось получить)",
+          "docs": "URI / base64 миниатюры (в getMedia теперь возвращается null для производительности)",
           "complexTypes": [],
           "type": "string | null"
         },
         {
           "name": "thumbnailWebPath",
           "tags": [],
-          "docs": "URL миниатюры (кэшированный файл ~300px), высокопроизводительный, для списков",
+          "docs": "URL миниатюры (в getMedia теперь возвращается null для производительности)",
           "complexTypes": [],
           "type": "string | null"
         },
@@ -328,6 +347,38 @@
             "MediaType"
           ],
           "type": "MediaType"
+        }
+      ]
+    },
+    {
+      "name": "GetThumbnailResult",
+      "slug": "getthumbnailresult",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "base64String",
+          "tags": [],
+          "docs": "Base64 строка изображения (с префиксом data:image/jpeg;base64,...)",
+          "complexTypes": [],
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "name": "GetThumbnailOptions",
+      "slug": "getthumbnailoptions",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "id",
+          "tags": [],
+          "docs": "ID медиафайла",
+          "complexTypes": [],
+          "type": "string"
         }
       ]
     }

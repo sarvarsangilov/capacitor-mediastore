@@ -63,4 +63,17 @@ public class CapacitorMediastorePlugin: CAPPlugin, CAPBridgedPlugin {
             }
         }
     }
+
+    @objc func getThumbnail(_ call: CAPPluginCall) {
+        guard let id = call.getString("id") else {
+            call.reject("Must provide id")
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.implementation.getThumbnail(id: id) { result in
+                call.resolve(result)
+            }
+        }
+    }
 }

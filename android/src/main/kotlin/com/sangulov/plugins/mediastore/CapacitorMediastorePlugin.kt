@@ -180,4 +180,19 @@ class CapacitorMediastorePlugin : Plugin() {
             call.reject("Failed to get media: ${e.message}", e)
         }
     }
+
+    @PluginMethod
+    fun getThumbnail(call: PluginCall) {
+        try {
+            val id = call.getString("id")
+            if (id == null) {
+                call.reject("Must provide id")
+                return
+            }
+            val result = mediaGallery.getThumbnail(id)
+            call.resolve(result)
+        } catch (e: Exception) {
+            call.reject("Failed to get thumbnail: ${e.message}", e)
+        }
+    }
 }

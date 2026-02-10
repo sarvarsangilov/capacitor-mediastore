@@ -17,6 +17,7 @@ npx cap sync
 * [`requestPermissions()`](#requestpermissions)
 * [`getAlbums()`](#getalbums)
 * [`getMedia(...)`](#getmedia)
+* [`getThumbnail(...)`](#getthumbnail)
 * [Interfaces](#interfaces)
 * [Type Aliases](#type-aliases)
 
@@ -70,13 +71,30 @@ getAlbums() => Promise<GetAlbumsResult>
 getMedia(options: GetMediaOptions) => Promise<GetMediaResult>
 ```
 
-Возвращает список медиафайлов с метаданными, поддерживает пагинацию и фильтрацию.
+Возвращает список медиафайлов с метаданными (БЕЗ миниатюр).
 
 | Param         | Type                                                        |
 | ------------- | ----------------------------------------------------------- |
 | **`options`** | <code><a href="#getmediaoptions">GetMediaOptions</a></code> |
 
 **Returns:** <code>Promise&lt;<a href="#getmediaresult">GetMediaResult</a>&gt;</code>
+
+--------------------
+
+
+### getThumbnail(...)
+
+```typescript
+getThumbnail(options: GetThumbnailOptions) => Promise<GetThumbnailResult>
+```
+
+Генерирует миниатюру для указанного медиафайла (Lazy Load).
+
+| Param         | Type                                                                |
+| ------------- | ------------------------------------------------------------------- |
+| **`options`** | <code><a href="#getthumbnailoptions">GetThumbnailOptions</a></code> |
+
+**Returns:** <code>Promise&lt;<a href="#getthumbnailresult">GetThumbnailResult</a>&gt;</code>
 
 --------------------
 
@@ -128,8 +146,8 @@ getMedia(options: GetMediaOptions) => Promise<GetMediaResult>
 | **`type`**             | <code>'photo' \| 'video'</code> | Тип: photo или video                                                                                                                                                                                                        |
 | **`uri`**              | <code>string</code>             | URI / путь к полноразмерному файлу (нативный идентификатор)                                                                                                                                                                 |
 | **`webPath`**          | <code>string \| null</code>     | URL, пригодный для использования в &lt;img src&gt; / &lt;video src&gt; внутри WebView. На Android: http://localhost/_capacitor_content_/... На iOS: capacitor://localhost/_capacitor_file_/tmp/... На Web: совпадает с uri. |
-| **`thumbnailUri`**     | <code>string \| null</code>     | URI / base64 миниатюры (может быть null, если не удалось получить)                                                                                                                                                          |
-| **`thumbnailWebPath`** | <code>string \| null</code>     | URL миниатюры (кэшированный файл ~300px), высокопроизводительный, для списков                                                                                                                                               |
+| **`thumbnailUri`**     | <code>string \| null</code>     | URI / base64 миниатюры (в getMedia теперь возвращается null для производительности)                                                                                                                                         |
+| **`thumbnailWebPath`** | <code>string \| null</code>     | URL миниатюры (в getMedia теперь возвращается null для производительности)                                                                                                                                                  |
 | **`width`**            | <code>number</code>             | Ширина в пикселях                                                                                                                                                                                                           |
 | **`height`**           | <code>number</code>             | Высота в пикселях                                                                                                                                                                                                           |
 | **`createdAt`**        | <code>string</code>             | Дата создания (ISO 8601 строка)                                                                                                                                                                                             |
@@ -147,6 +165,20 @@ getMedia(options: GetMediaOptions) => Promise<GetMediaResult>
 | **`limit`**   | <code>number</code>                             | Максимальное количество элементов                        |
 | **`offset`**  | <code>number</code>                             | Сдвиг для пагинации                                      |
 | **`type`**    | <code><a href="#mediatype">MediaType</a></code> | Тип медиа: 'photo', 'video' или 'all'                    |
+
+
+#### GetThumbnailResult
+
+| Prop               | Type                | Description                                                        |
+| ------------------ | ------------------- | ------------------------------------------------------------------ |
+| **`base64String`** | <code>string</code> | Base64 строка изображения (с префиксом data:image/jpeg;base64,...) |
+
+
+#### GetThumbnailOptions
+
+| Prop     | Type                | Description   |
+| -------- | ------------------- | ------------- |
+| **`id`** | <code>string</code> | ID медиафайла |
 
 
 ### Type Aliases
