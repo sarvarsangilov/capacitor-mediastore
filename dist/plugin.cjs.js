@@ -1,4 +1,11 @@
-import { WebPlugin } from '@capacitor/core';
+'use strict';
+
+var core = require('@capacitor/core');
+
+const CapacitorMediastore = core.registerPlugin('CapacitorMediastore', {
+    web: () => Promise.resolve().then(function () { return web; }).then((m) => new m.CapacitorMediastoreWeb()),
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Web (Mock) Implementation
 // ─────────────────────────────────────────────────────────────────────────────
@@ -85,7 +92,7 @@ function generateMockMedia(count) {
     return items;
 }
 const MOCK_MEDIA = generateMockMedia(128);
-export class CapacitorMediastoreWeb extends WebPlugin {
+class CapacitorMediastoreWeb extends core.WebPlugin {
     // ── Permissions ──────────────────────────────────────────────────────────
     async checkPermissions() {
         // На вебе разрешения всегда «granted»
@@ -123,4 +130,11 @@ export class CapacitorMediastoreWeb extends WebPlugin {
         return { base64String };
     }
 }
-//# sourceMappingURL=web.js.map
+
+var web = /*#__PURE__*/Object.freeze({
+    __proto__: null,
+    CapacitorMediastoreWeb: CapacitorMediastoreWeb
+});
+
+exports.CapacitorMediastore = CapacitorMediastore;
+//# sourceMappingURL=plugin.cjs.js.map
