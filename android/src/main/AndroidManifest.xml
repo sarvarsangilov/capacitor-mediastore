@@ -1,9 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- Android 10–12 (API 29–32) -->
-    <uses-permission
+    <!-- <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
-        android:maxSdkVersion="32" />
+        android:maxSdkVersion="32" /> -->
 
     <!-- Android 13 (API 33) -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
