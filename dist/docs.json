@@ -1,0 +1,357 @@
+{
+  "api": {
+    "name": "CapacitorMediastorePlugin",
+    "slug": "capacitormediastoreplugin",
+    "docs": "",
+    "tags": [],
+    "methods": [
+      {
+        "name": "checkPermissions",
+        "signature": "() => Promise<PermissionResult>",
+        "parameters": [],
+        "returns": "Promise<PermissionResult>",
+        "tags": [],
+        "docs": "Проверяет текущий статус разрешений на доступ к медиагалерее.",
+        "complexTypes": [
+          "PermissionResult"
+        ],
+        "slug": "checkpermissions"
+      },
+      {
+        "name": "requestPermissions",
+        "signature": "() => Promise<PermissionResult>",
+        "parameters": [],
+        "returns": "Promise<PermissionResult>",
+        "tags": [],
+        "docs": "Запрашивает у пользователя разрешения на доступ к медиагалерее.",
+        "complexTypes": [
+          "PermissionResult"
+        ],
+        "slug": "requestpermissions"
+      },
+      {
+        "name": "getAlbums",
+        "signature": "() => Promise<GetAlbumsResult>",
+        "parameters": [],
+        "returns": "Promise<GetAlbumsResult>",
+        "tags": [],
+        "docs": "Возвращает список альбомов на устройстве.",
+        "complexTypes": [
+          "GetAlbumsResult"
+        ],
+        "slug": "getalbums"
+      },
+      {
+        "name": "getMedia",
+        "signature": "(options: GetMediaOptions) => Promise<GetMediaResult>",
+        "parameters": [
+          {
+            "name": "options",
+            "docs": "",
+            "type": "GetMediaOptions"
+          }
+        ],
+        "returns": "Promise<GetMediaResult>",
+        "tags": [],
+        "docs": "Возвращает список медиафайлов с метаданными, поддерживает пагинацию и фильтрацию.",
+        "complexTypes": [
+          "GetMediaResult",
+          "GetMediaOptions"
+        ],
+        "slug": "getmedia"
+      }
+    ],
+    "properties": []
+  },
+  "interfaces": [
+    {
+      "name": "PermissionResult",
+      "slug": "permissionresult",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "photos",
+          "tags": [],
+          "docs": "Статус разрешения на чтение фото",
+          "complexTypes": [
+            "PermissionStatus"
+          ],
+          "type": "PermissionStatus"
+        },
+        {
+          "name": "videos",
+          "tags": [],
+          "docs": "Статус разрешения на чтение видео",
+          "complexTypes": [
+            "PermissionStatus"
+          ],
+          "type": "PermissionStatus"
+        }
+      ]
+    },
+    {
+      "name": "GetAlbumsResult",
+      "slug": "getalbumsresult",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "albums",
+          "tags": [],
+          "docs": "",
+          "complexTypes": [
+            "Album"
+          ],
+          "type": "Album[]"
+        }
+      ]
+    },
+    {
+      "name": "Album",
+      "slug": "album",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "id",
+          "tags": [],
+          "docs": "Уникальный идентификатор альбома",
+          "complexTypes": [],
+          "type": "string"
+        },
+        {
+          "name": "title",
+          "tags": [],
+          "docs": "Название альбома",
+          "complexTypes": [],
+          "type": "string"
+        },
+        {
+          "name": "count",
+          "tags": [],
+          "docs": "Количество медиафайлов в альбоме",
+          "complexTypes": [],
+          "type": "number"
+        },
+        {
+          "name": "coverUri",
+          "tags": [],
+          "docs": "URI / путь обложки альбома (первый медиафайл). Может быть `null`.",
+          "complexTypes": [],
+          "type": "string | null"
+        }
+      ]
+    },
+    {
+      "name": "GetMediaResult",
+      "slug": "getmediaresult",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "media",
+          "tags": [],
+          "docs": "",
+          "complexTypes": [
+            "MediaItem"
+          ],
+          "type": "MediaItem[]"
+        },
+        {
+          "name": "total",
+          "tags": [],
+          "docs": "Общее количество медиа, соответствующих фильтру (для пагинации)",
+          "complexTypes": [],
+          "type": "number"
+        },
+        {
+          "name": "hasMore",
+          "tags": [],
+          "docs": "Есть ли ещё элементы после текущей страницы",
+          "complexTypes": [],
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "name": "MediaItem",
+      "slug": "mediaitem",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "id",
+          "tags": [],
+          "docs": "Уникальный идентификатор медиафайла",
+          "complexTypes": [],
+          "type": "string"
+        },
+        {
+          "name": "type",
+          "tags": [],
+          "docs": "Тип: photo или video",
+          "complexTypes": [],
+          "type": "'photo' | 'video'"
+        },
+        {
+          "name": "uri",
+          "tags": [],
+          "docs": "URI / путь к полноразмерному файлу",
+          "complexTypes": [],
+          "type": "string"
+        },
+        {
+          "name": "thumbnailUri",
+          "tags": [],
+          "docs": "URI / base64 миниатюры (может быть null, если не удалось получить)",
+          "complexTypes": [],
+          "type": "string | null"
+        },
+        {
+          "name": "width",
+          "tags": [],
+          "docs": "Ширина в пикселях",
+          "complexTypes": [],
+          "type": "number"
+        },
+        {
+          "name": "height",
+          "tags": [],
+          "docs": "Высота в пикселях",
+          "complexTypes": [],
+          "type": "number"
+        },
+        {
+          "name": "createdAt",
+          "tags": [],
+          "docs": "Дата создания (ISO 8601 строка)",
+          "complexTypes": [],
+          "type": "string"
+        },
+        {
+          "name": "duration",
+          "tags": [],
+          "docs": "Длительность в секундах (только для видео, 0 для фото)",
+          "complexTypes": [],
+          "type": "number"
+        },
+        {
+          "name": "mimeType",
+          "tags": [],
+          "docs": "MIME-тип файла",
+          "complexTypes": [],
+          "type": "string"
+        },
+        {
+          "name": "fileSize",
+          "tags": [],
+          "docs": "Размер файла в байтах",
+          "complexTypes": [],
+          "type": "number"
+        },
+        {
+          "name": "fileName",
+          "tags": [],
+          "docs": "Имя файла",
+          "complexTypes": [],
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "name": "GetMediaOptions",
+      "slug": "getmediaoptions",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "albumId",
+          "tags": [],
+          "docs": "ID альбома. Если не передан — возвращает все медиафайлы.",
+          "complexTypes": [],
+          "type": "string | undefined"
+        },
+        {
+          "name": "limit",
+          "tags": [],
+          "docs": "Максимальное количество элементов",
+          "complexTypes": [],
+          "type": "number"
+        },
+        {
+          "name": "offset",
+          "tags": [],
+          "docs": "Сдвиг для пагинации",
+          "complexTypes": [],
+          "type": "number"
+        },
+        {
+          "name": "type",
+          "tags": [],
+          "docs": "Тип медиа: 'photo', 'video' или 'all'",
+          "complexTypes": [
+            "MediaType"
+          ],
+          "type": "MediaType"
+        }
+      ]
+    }
+  ],
+  "enums": [],
+  "typeAliases": [
+    {
+      "name": "PermissionStatus",
+      "slug": "permissionstatus",
+      "docs": "Статус разрешения для конкретного scope.\n - `granted`  — полный доступ ко всем медиафайлам.\n - `limited`  — доступ только к выбранным пользователем файлам (iOS 14+ / Android 14+).\n - `denied`   — пользователь отклонил запрос.\n - `prompt`   — разрешение ещё не запрашивалось.\n - `prompt-with-rationale` — ранее отклонено, но можно показать объяснение (Android).",
+      "types": [
+        {
+          "text": "'granted'",
+          "complexTypes": []
+        },
+        {
+          "text": "'limited'",
+          "complexTypes": []
+        },
+        {
+          "text": "'denied'",
+          "complexTypes": []
+        },
+        {
+          "text": "'prompt'",
+          "complexTypes": []
+        },
+        {
+          "text": "'prompt-with-rationale'",
+          "complexTypes": []
+        }
+      ]
+    },
+    {
+      "name": "MediaType",
+      "slug": "mediatype",
+      "docs": "Тип медиафайла.",
+      "types": [
+        {
+          "text": "'photo'",
+          "complexTypes": []
+        },
+        {
+          "text": "'video'",
+          "complexTypes": []
+        },
+        {
+          "text": "'all'",
+          "complexTypes": []
+        }
+      ]
+    }
+  ],
+  "pluginConfigs": []
+}
