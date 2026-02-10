@@ -1,4 +1,4 @@
-package com.mycompany.capacitor.mediastore
+package com.sangulov.plugins.mediastore
 
 import android.Manifest
 import android.content.pm.PackageManager
@@ -53,7 +53,7 @@ class CapacitorMediastorePlugin : Plugin() {
     // ────────────────────────────────────────────────────────────────────────
 
     @PluginMethod
-    fun checkPermissions(call: PluginCall) {
+    override fun checkPermissions(call: PluginCall) {
         try {
             call.resolve(buildPermissionResult())
         } catch (e: Exception) {
@@ -62,7 +62,7 @@ class CapacitorMediastorePlugin : Plugin() {
     }
 
     @PluginMethod
-    fun requestPermissions(call: PluginCall) {
+    override fun requestPermissions(call: PluginCall) {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 // Android 14+ — запрашиваем READ_MEDIA_VISUAL_USER_SELECTED + READ_MEDIA_IMAGES + READ_MEDIA_VIDEO
@@ -100,9 +100,9 @@ class CapacitorMediastorePlugin : Plugin() {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             // Android 14+: проверяем READ_MEDIA_VISUAL_USER_SELECTED для "limited" доступа
-            val fullPhotos = hasPermission(Manifest.permission.READ_MEDIA_IMAGES)
-            val fullVideos = hasPermission(Manifest.permission.READ_MEDIA_VIDEO)
-            val userSelected = hasPermission("android.permission.READ_MEDIA_VISUAL_USER_SELECTED")
+            val fullPhotos = isPermissionGranted(Manifest.permission.READ_MEDIA_IMAGES)
+            val fullVideos = isPermissionGranted(Manifest.permission.READ_MEDIA_VIDEO)
+            val userSelected = isPermissionGranted("android.permission.READ_MEDIA_VISUAL_USER_SELECTED")
 
             result.put("photos", when {
                 fullPhotos -> "granted"
@@ -133,7 +133,7 @@ class CapacitorMediastorePlugin : Plugin() {
     /**
      * Проверяет наличие конкретного разрешения.
      */
-    private fun hasPermission(permission: String): Boolean {
+    private fun isPermissionGranted(permission: String): Boolean {
         return ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
     }
 
@@ -142,7 +142,7 @@ class CapacitorMediastorePlugin : Plugin() {
      */
     private fun permissionStatusString(permission: String): String {
         return when {
-            hasPermission(permission) -> "granted"
+            isPermissionGranted(permission) -> "granted"
             activity.shouldShowRequestPermissionRationale(permission) -> "prompt-with-rationale"
             else -> "prompt"
         }

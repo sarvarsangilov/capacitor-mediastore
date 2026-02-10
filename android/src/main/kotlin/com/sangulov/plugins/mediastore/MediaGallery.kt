@@ -1,4 +1,4 @@
-package com.mycompany.capacitor.mediastore
+package com.sangulov.plugins.mediastore
 
 import android.content.ContentResolver
 import android.content.ContentUris
