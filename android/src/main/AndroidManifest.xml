@@ -12,4 +12,7 @@
     <!-- Android 14+ (API 34): частичный доступ к визуальным медиа -->
     <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
 
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    
+
 </manifest>
