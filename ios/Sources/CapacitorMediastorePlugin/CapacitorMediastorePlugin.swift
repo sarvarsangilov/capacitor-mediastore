@@ -16,7 +16,8 @@ public class CapacitorMediastorePlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "checkPermissions", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "requestPermissions", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getAlbums", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "getMedia", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "getMedia", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getThumbnail", returnType: CAPPluginReturnPromise)
     ]
 
     private let implementation = CapacitorMediastore()
