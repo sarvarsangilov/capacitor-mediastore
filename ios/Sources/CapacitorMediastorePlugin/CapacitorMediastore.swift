@@ -109,6 +109,9 @@ import UIKit
     /**
      * Проходит по результатам fetch и возвращает альбомы с ненулевым количеством (асинхронно).
      */
+    /**
+     * Проходит по результатам fetch и возвращает альбомы с ненулевым количеством (асинхронно).
+     */
     private func collectAlbums(
         from fetchResult: PHFetchResult<PHAssetCollection>,
         completion: @escaping ([[String: Any]]) -> Void
@@ -116,25 +119,26 @@ import UIKit
         let fetchOptions = PHFetchOptions()
         fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
 
-        var albums: [Int: [String: Any]] = [:]
-        let group = DispatchGroup()
-        let queue = DispatchQueue(label: "com.sangulov.plugins.mediastore.collect", attributes: .concurrent)
-        
-        // Массив индексов, чтобы итерироваться
         let count = fetchResult.count
         guard count > 0 else {
             completion([])
             return
         }
 
+        var albums: [Int: [String: Any]] = [:]
+        let lock = NSLock()
+        
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "com.sangulov.plugins.mediastore.collect", attributes: .concurrent)
+        
         for i in 0..<count {
             let collection = fetchResult.object(at: i)
             group.enter()
             
             queue.async {
                 let assets = PHAsset.fetchAssets(in: collection, options: fetchOptions)
-                let count = assets.count
-                guard count > 0 else {
+                let assetCount = assets.count
+                guard assetCount > 0 else {
                     group.leave()
                     return
                 }
@@ -155,7 +159,7 @@ import UIKit
                         innerGroup.leave()
                     }
                     
-                    // Резолвим thumbnail (синхронно, так как options.isSynchronous = true)
+                    // Резолвим thumbnail (синхронно)
                     let imageManager = PHCachingImageManager()
                     let thumbOptions = PHImageRequestOptions()
                     thumbOptions.isSynchronous = true
@@ -176,15 +180,16 @@ import UIKit
                 let album: [String: Any] = [
                     "id": collection.localIdentifier,
                     "title": collection.localizedTitle ?? "Untitled",
-                    "count": count,
+                    "count": assetCount,
                     "coverUri": coverUri ?? NSNull(),
                     "coverWebPath": coverWebPath ?? NSNull(),
                     "coverThumbnailWebPath": coverThumbnailWebPath ?? NSNull()
                 ]
                 
-                queue.async(flags: .barrier) {
-                    albums[i] = album
-                }
+                lock.lock()
+                albums[i] = album
+                lock.unlock()
+                
                 group.leave()
             }
         }
@@ -193,8 +198,12 @@ import UIKit
              // Собираем результаты
              var result: [[String: Any]] = []
              for i in 0..<count {
-                 if let album = albums[i] {
-                     result.append(album)
+                 lock.lock()
+                 let album = albums[i]
+                 lock.unlock()
+                 
+                 if let a = album {
+                     result.append(a)
                  }
              }
              completion(result)
@@ -203,16 +212,6 @@ import UIKit
 
     // MARK: - Media
 
-    /**
-     * Возвращает медиафайлы с метаданными, пагинацией и фильтрацией.
-     *
-     * - Parameters:
-     *   - albumId: localIdentifier альбома. nil = все медиа.
-     *   - limit: Максимальное количество элементов.
-     *   - offset: Сдвиг для пагинации.
-     *   - type: "photo", "video" или "all".
-     *   - completion: Вызывается с результатом (основной поток не гарантирован).
-     */
     /**
      * Возвращает медиафайлы с метаданными и путями.
      */
@@ -265,7 +264,9 @@ import UIKit
             return
         }
 
-        var items: [Int: [String: Any]] = [:] // Dictionary for thread-safe writing by index
+        var items: [Int: [String: Any]] = [:] 
+        let lock = NSLock()
+        
         let group = DispatchGroup()
         let queue = DispatchQueue(label: "com.sangulov.plugins.mediastore.processing", attributes: .concurrent)
 
@@ -277,6 +278,8 @@ import UIKit
         thumbOptions.isSynchronous = true
         thumbOptions.deliveryMode = .fastFormat
         thumbOptions.resizeMode = .fast
+        
+        // Оптимизация размера превью
         let thumbSize = CGSize(width: 200, height: 200)
 
         for i in range {
@@ -286,16 +289,24 @@ import UIKit
             
             group.enter()
             
-            // Базовая инфо и миниатюра (синхронно)
-            var item = self.assetToItem(asset: asset, imageManager: imageManager, thumbOptions: thumbOptions, thumbSize: thumbSize)
-            
-            // Получение webPath (асинхронно)
-            self.resolveWebPath(for: asset) { webPath in
-                item["webPath"] = webPath
-                queue.async(flags: .barrier) {
+            // Запускаем обработку каждого медиа асинхронно
+            queue.async {
+                // Базовая инфо и миниатюра (синхронно внутри assetToItem)
+                var item = self.assetToItem(asset: asset, imageManager: imageManager, thumbOptions: thumbOptions, thumbSize: thumbSize)
+                
+                // Получение webPath (асинхронно)
+                // Note: resolveWebPath is async but we need to wait for it or just handle it
+                // Since resolveWebPath takes a closure, let's wrap it properly.
+                
+                self.resolveWebPath(for: asset) { webPath in
+                    item["webPath"] = webPath
+                    
+                    lock.lock()
                     items[index] = item
+                    lock.unlock()
+                    
+                    group.leave()
                 }
-                group.leave()
             }
         }
 
@@ -303,8 +314,12 @@ import UIKit
             // Собираем массив в правильном порядке
             var sortedItems: [[String: Any]] = []
             for i in 0..<safeLimit {
-                if let item = items[i] {
-                    sortedItems.append(item)
+                lock.lock()
+                let item = items[i]
+                lock.unlock()
+                
+                if let it = item {
+                    sortedItems.append(it)
                 }
             }
             completion(["media": sortedItems, "total": total, "hasMore": hasMore])
