@@ -390,12 +390,13 @@ import UIKit
             return
         }
 
-        let imageManager = PHCachingImageManager()
+        let imageManager = PHImageManager.default()
         let options = PHImageRequestOptions()
-        options.isSynchronous = true // Важно: предотвращаем множественные вызовы completion (degraded -> high quality)
-        options.deliveryMode = .fastFormat
-        options.resizeMode = .fast
+        options.isSynchronous = true 
         options.isNetworkAccessAllowed = true
+        // .fastFormat/.fast can fail with 3303 if no suitable resource is found. 
+        // .exact ensures resizing/decoding happens if needed.
+        options.resizeMode = .exact
 
         let targetSize = CGSize(width: 256, height: 256)
 
@@ -405,6 +406,10 @@ import UIKit
             contentMode: .aspectFill,
             options: options
         ) { image, info in
+            if let error = info?[PHImageErrorKey] as? Error {
+                print("Error getting thumbnail for \(id): \(error)")
+            }
+            
             if let img = image,
                let data = img.jpegData(compressionQuality: 0.6) {
                 let base64 = data.base64EncodedString()
