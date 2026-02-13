@@ -242,7 +242,7 @@
         {
           "name": "webPath",
           "tags": [],
-          "docs": "URL, пригодный для использования в <img src> / <video src> внутри WebView.\nНа Android: content://... (используйте Capacitor.convertFileSrc для http/https)\nНа iOS: capacitor://localhost/_capacitor_file_/tmp/...\nНа Web: совпадает с uri.",
+          "docs": "URL, пригодный для использования в <img src> / <video src> внутри WebView.\nНа Android: https://localhost/_capacitor_content_/...\nНа iOS: capacitor://localhost/_capacitor_file_/tmp/...\nНа Web: совпадает с uri.",
           "complexTypes": [],
           "type": "string | null"
         },

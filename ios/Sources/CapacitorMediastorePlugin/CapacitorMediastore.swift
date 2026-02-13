@@ -461,41 +461,28 @@ import UIKit
     }
     
     private func resolveWebPath(for asset: PHAsset, completion: @escaping (String?) -> Void) {
-        if asset.mediaType == .video {
-            let options = PHVideoRequestOptions()
-            options.isNetworkAccessAllowed = true
-            options.version = .original // Request original to ensure we get AVURLAsset (file path) instead of AVComposition
-            
-            PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { avAsset, _, _ in
-                if let urlAsset = avAsset as? AVURLAsset {
-                    completion(self.convertToCapacitorPath(url: urlAsset.url))
-                } else {
-                    // Fallback: try default version if original fails
-                    let retryOptions = PHVideoRequestOptions()
-                    retryOptions.isNetworkAccessAllowed = true
-                    retryOptions.version = .current
-                    PHImageManager.default().requestAVAsset(forVideo: asset, options: retryOptions) { retryAsset, _, _ in
-                        if let urlAsset = retryAsset as? AVURLAsset {
-                            completion(self.convertToCapacitorPath(url: urlAsset.url))
-                        } else {
-                            completion(nil)
-                        }
-                    }
-                }
-            }
-            return
-        }
-
-        // Photo / Image logic
         let options = PHContentEditingInputRequestOptions()
-        options.isNetworkAccessAllowed = true
-        
+        options.isNetworkAccessAllowed = true // разрешаем скачивание из iCloud
+
         asset.requestContentEditingInput(with: options) { input, info in
-            if let url = input?.fullSizeImageURL {
-                completion(self.convertToCapacitorPath(url: url))
-            } else {
+            guard let url = input?.fullSizeImageURL else {
+                // Для видео fallback
+                if asset.mediaType == .video {
+                   let videoOptions = PHVideoRequestOptions()
+                   videoOptions.isNetworkAccessAllowed = true
+                   PHImageManager.default().requestAVAsset(forVideo: asset, options: videoOptions) { avAsset, _, _ in
+                       if let urlAsset = avAsset as? AVURLAsset {
+                           completion(self.convertToCapacitorPath(url: urlAsset.url))
+                       } else {
+                           completion(nil)
+                       }
+                   }
+                   return
+                }
                 completion(nil)
+                return
             }
+            completion(self.convertToCapacitorPath(url: url))
         }
     }
     
