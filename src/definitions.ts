@@ -54,7 +54,7 @@ export interface MediaItem {
   uri: string;
   /**
    * URL, пригодный для использования в <img src> / <video src> внутри WebView.
-   * На Android: https://localhost/_capacitor_content_/...
+   * На Android: content://... (используйте Capacitor.convertFileSrc для http/https)
    * На iOS: capacitor://localhost/_capacitor_file_/tmp/...
    * На Web: совпадает с uri.
    */

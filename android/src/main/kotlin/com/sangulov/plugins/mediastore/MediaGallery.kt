@@ -273,19 +273,14 @@ class MediaGallery(private val context: Context) {
     }
 
     private fun contentUriToWebPath(contentUri: String): String {
-        return if (contentUri.startsWith("content://")) {
-            val path = contentUri.removePrefix("content://")
-            "https://localhost/_capacitor_content_/$path"
-        } else {
-            contentUri
-        }
+        return contentUri
     }
 
     private fun getOrCreateThumbnailFile(mediaId: Long, contentUriStr: String, isVideo: Boolean): String? {
         // Used for ALBUMS mostly now, keeping file-based approach for consistency in getAlbums
         val cacheDir = context.cacheDir
         val thumbFile = File(cacheDir, "thumb_$mediaId.jpg")
-        if (thumbFile.exists()) return "https://localhost/_capacitor_file_" + thumbFile.absolutePath
+        if (thumbFile.exists()) return "file://" + thumbFile.absolutePath
 
         try {
             val contentUri = Uri.parse(contentUriStr)
@@ -308,7 +303,7 @@ class MediaGallery(private val context: Context) {
 
             if (bitmap != null) {
                 FileOutputStream(thumbFile).use { out -> bitmap.compress(Bitmap.CompressFormat.JPEG, 70, out) }
-                return "https://localhost/_capacitor_file_" + thumbFile.absolutePath
+                return "file://" + thumbFile.absolutePath
             }
         } catch (e: Exception) { }
         return null
