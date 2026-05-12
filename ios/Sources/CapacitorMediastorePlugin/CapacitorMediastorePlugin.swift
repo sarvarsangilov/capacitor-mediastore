@@ -5,7 +5,8 @@ import Capacitor
  * CapacitorMediastorePlugin — Capacitor 8.x plugin для iOS.
  *
  * Предоставляет доступ к фото/видео галерее через Photos framework.
- * Методы: checkPermissions, requestPermissions, getAlbums, getMedia.
+ * Методы: checkPermissions, requestPermissions, getAlbums, getMedia,
+ *         getThumbnail (lazy, file URL), getThumbnails (batch, file URLs).
  */
 @objc(CapacitorMediastorePlugin)
 public class CapacitorMediastorePlugin: CAPPlugin, CAPBridgedPlugin {
@@ -17,7 +18,8 @@ public class CapacitorMediastorePlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "requestPermissions", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getAlbums", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getMedia", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "getThumbnail", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "getThumbnail", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getThumbnails", returnType: CAPPluginReturnPromise)
     ]
 
     private let implementation = CapacitorMediastore()
@@ -70,9 +72,25 @@ public class CapacitorMediastorePlugin: CAPPlugin, CAPBridgedPlugin {
             call.reject("Must provide id")
             return
         }
+        let returnBase64 = call.getBool("returnBase64") ?? false
+        let size = call.getInt("size") ?? 256
 
         DispatchQueue.global(qos: .userInitiated).async {
-            self.implementation.getThumbnail(id: id) { result in
+            self.implementation.getThumbnail(id: id, returnBase64: returnBase64, size: size) { result in
+                call.resolve(result)
+            }
+        }
+    }
+
+    @objc func getThumbnails(_ call: CAPPluginCall) {
+        guard let ids = call.getArray("ids", String.self) else {
+            call.reject("Must provide ids array")
+            return
+        }
+        let size = call.getInt("size") ?? 256
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.implementation.getThumbnails(ids: ids, size: size) { result in
                 call.resolve(result)
             }
         }

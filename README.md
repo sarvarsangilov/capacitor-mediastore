@@ -1,6 +1,6 @@
 # capacitor-mediastore
 
-CapacitorMediastore Capacitor Plugin
+CapacitorMediastore Capacitor Plugin — быстрый доступ к медиагалерее устройства из Capacitor (Android / iOS / Web).
 
 ## Install
 
@@ -8,6 +8,45 @@ CapacitorMediastore Capacitor Plugin
 npm install capacitor-mediastore
 npx cap sync
 ```
+
+## Performance / как не тормозить webview
+
+Плагин спроектирован под виртуализированные списки превью. Ключевые принципы:
+
+1. **`getMedia` НЕ возвращает миниатюры** (`thumbnailWebPath = null`) — это сознательная оптимизация. Подгружайте превью лениво, по мере появления элемента в viewport.
+2. **Используйте `webPath`, а не base64.** `getThumbnail` по умолчанию отдаёт `webPath` — путь к закешированному JPEG, который webview грузит нативно. Это в 5–10× быстрее `data:`-URL и не раздувает DOM:
+
+   ```ts
+   const { webPath } = await CapacitorMediastore.getThumbnail({ id });
+   imgEl.src = webPath; // нативный кеш браузера, без копирования через JS-мост
+   ```
+
+   Если по каким-то причинам нужна base64-строка (например, для inline-аватарок в IndexedDB), запросите явно:
+
+   ```ts
+   const { base64String } = await CapacitorMediastore.getThumbnail({ id, returnBase64: true });
+   ```
+
+3. **Группируйте запросы через `getThumbnails`.** Один нативный вызов на пачку видимых элементов вместо N round-trip'ов:
+
+   ```ts
+   // visibleIds — id'шники медиа, которые сейчас в viewport
+   const { thumbnails } = await CapacitorMediastore.getThumbnails({ ids: visibleIds, size: 256 });
+   visibleIds.forEach(id => {
+     const img = domMap.get(id);
+     if (img && thumbnails[id]) img.src = thumbnails[id];
+   });
+   ```
+
+4. **Подсказки для `<img>`:** используйте `loading="lazy" decoding="async"` — webview сам решает, когда декодировать:
+
+   ```html
+   <img src="${webPath}" loading="lazy" decoding="async" />
+   ```
+
+5. **Размер миниатюры:** по умолчанию 256×256. Если в UI плитки <128 px — передавайте `size: 128`, это экономит память.
+6. **Android** запускает все методы в `Dispatchers.IO`, не блокируя bridge-поток. **iOS** использует `PHCachingImageManager` с прогревом кеша для пакетных запросов.
+7. **Кеш миниатюр** живёт в `cacheDir/mediastore_thumbs/` (Android) и `Caches/mediastore_thumbs/` (iOS). Система сама очистит его при нехватке места — вручную чистить не нужно.
 
 ## API
 
@@ -18,6 +57,7 @@ npx cap sync
 * [`getAlbums()`](#getalbums)
 * [`getMedia(...)`](#getmedia)
 * [`getThumbnail(...)`](#getthumbnail)
+* [`getThumbnails(...)`](#getthumbnails)
 * [Interfaces](#interfaces)
 * [Type Aliases](#type-aliases)
 
@@ -89,12 +129,31 @@ getThumbnail(options: GetThumbnailOptions) => Promise<GetThumbnailResult>
 ```
 
 Генерирует миниатюру для указанного медиафайла (Lazy Load).
+По умолчанию возвращает `webPath` (file URL), что значительно быстрее, чем Base64.
 
 | Param         | Type                                                                |
 | ------------- | ------------------------------------------------------------------- |
 | **`options`** | <code><a href="#getthumbnailoptions">GetThumbnailOptions</a></code> |
 
 **Returns:** <code>Promise&lt;<a href="#getthumbnailresult">GetThumbnailResult</a>&gt;</code>
+
+--------------------
+
+
+### getThumbnails(...)
+
+```typescript
+getThumbnails(options: GetThumbnailsOptions) => Promise<GetThumbnailsResult>
+```
+
+Пакетная генерация миниатюр (Lazy Load для виртуализированных списков).
+Один нативный вызов = N миниатюр, что устраняет overhead на JS-мост.
+
+| Param         | Type                                                                  |
+| ------------- | --------------------------------------------------------------------- |
+| **`options`** | <code><a href="#getthumbnailsoptions">GetThumbnailsOptions</a></code> |
+
+**Returns:** <code>Promise&lt;<a href="#getthumbnailsresult">GetThumbnailsResult</a>&gt;</code>
 
 --------------------
 
@@ -126,7 +185,7 @@ getThumbnail(options: GetThumbnailOptions) => Promise<GetThumbnailResult>
 | **`count`**                 | <code>number</code>         | Количество медиафайлов в альбоме                                                      |
 | **`coverUri`**              | <code>string \| null</code> | URI / путь обложки альбома (нативный идентификатор). Может быть `null`.               |
 | **`coverWebPath`**          | <code>string \| null</code> | URL обложки, пригодный для использования в &lt;img src&gt; внутри WebView (оригинал)  |
-| **`coverThumbnailWebPath`** | <code>string \| null</code> | URL миниатюры обложки (кэшированный файл ~300px), высокопроизводительный, для списков |
+| **`coverThumbnailWebPath`** | <code>string \| null</code> | URL миниатюры обложки (кэшированный файл ~256px), высокопроизводительный, для списков |
 
 
 #### GetMediaResult
@@ -169,16 +228,34 @@ getThumbnail(options: GetThumbnailOptions) => Promise<GetThumbnailResult>
 
 #### GetThumbnailResult
 
-| Prop               | Type                | Description                                                        |
-| ------------------ | ------------------- | ------------------------------------------------------------------ |
-| **`base64String`** | <code>string</code> | Base64 строка изображения (с префиксом data:image/jpeg;base64,...) |
+| Prop               | Type                | Description                                                                                                                                                                                                   |
+| ------------------ | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`webPath`**      | <code>string</code> | URL для использования в `&lt;img src&gt;` (`https://localhost/_capacitor_file_/...` на Android, `capacitor://localhost/_capacitor_file_/...` на iOS). Пустая строка, если миниатюру не удалось сгенерировать. |
+| **`base64String`** | <code>string</code> | Base64-data-URL (`data:image/jpeg;base64,...`). Пустая строка, если `returnBase64` не был запрошен.                                                                                                           |
 
 
 #### GetThumbnailOptions
 
-| Prop     | Type                | Description   |
-| -------- | ------------------- | ------------- |
-| **`id`** | <code>string</code> | ID медиафайла |
+| Prop               | Type                 | Description                                                                                                                                       |
+| ------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`id`**           | <code>string</code>  | ID медиафайла                                                                                                                                     |
+| **`returnBase64`** | <code>boolean</code> | Если `true` — дополнительно вернуть `base64String` (legacy / fallback). По умолчанию `false` — возвращается только `webPath`, что в разы быстрее. |
+| **`size`**         | <code>number</code>  | Сторона квадратной миниатюры в пикселях. По умолчанию 256.                                                                                        |
+
+
+#### GetThumbnailsResult
+
+| Prop             | Type                                                            | Description                                                                                           |
+| ---------------- | --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| **`thumbnails`** | <code><a href="#record">Record</a>&lt;string, string&gt;</code> | Словарь: `id` → `webPath`. ID, для которых миниатюру не удалось сгенерировать, в словаре отсутствуют. |
+
+
+#### GetThumbnailsOptions
+
+| Prop       | Type                  | Description                                                |
+| ---------- | --------------------- | ---------------------------------------------------------- |
+| **`ids`**  | <code>string[]</code> | Массив ID медиафайлов                                      |
+| **`size`** | <code>number</code>   | Сторона квадратной миниатюры в пикселях. По умолчанию 256. |
 
 
 ### Type Aliases
@@ -201,5 +278,12 @@ getThumbnail(options: GetThumbnailOptions) => Promise<GetThumbnailResult>
 Тип медиафайла.
 
 <code>'photo' | 'video' | 'all'</code>
+
+
+#### Record
+
+Construct a type with a set of properties K of type T
+
+<code>{ [P in K]: T; }</code>
 
 </docgen-api>

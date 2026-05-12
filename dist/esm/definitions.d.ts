@@ -28,7 +28,7 @@ export interface Album {
     coverUri: string | null;
     /** URL обложки, пригодный для использования в <img src> внутри WebView (оригинал) */
     coverWebPath: string | null;
-    /** URL миниатюры обложки (кэшированный файл ~300px), высокопроизводительный, для списков */
+    /** URL миниатюры обложки (кэшированный файл ~256px), высокопроизводительный, для списков */
     coverThumbnailWebPath: string | null;
 }
 export interface GetAlbumsResult {
@@ -87,10 +87,39 @@ export interface GetMediaResult {
 export interface GetThumbnailOptions {
     /** ID медиафайла */
     id: string;
+    /**
+     * Если `true` — дополнительно вернуть `base64String` (legacy / fallback).
+     * По умолчанию `false` — возвращается только `webPath`, что в разы быстрее.
+     */
+    returnBase64?: boolean;
+    /** Сторона квадратной миниатюры в пикселях. По умолчанию 256. */
+    size?: number;
 }
 export interface GetThumbnailResult {
-    /** Base64 строка изображения (с префиксом data:image/jpeg;base64,...) */
+    /**
+     * URL для использования в `<img src>` (`https://localhost/_capacitor_file_/...`
+     * на Android, `capacitor://localhost/_capacitor_file_/...` на iOS).
+     * Пустая строка, если миниатюру не удалось сгенерировать.
+     */
+    webPath: string;
+    /**
+     * Base64-data-URL (`data:image/jpeg;base64,...`). Пустая строка, если
+     * `returnBase64` не был запрошен.
+     */
     base64String: string;
+}
+export interface GetThumbnailsOptions {
+    /** Массив ID медиафайлов */
+    ids: string[];
+    /** Сторона квадратной миниатюры в пикселях. По умолчанию 256. */
+    size?: number;
+}
+export interface GetThumbnailsResult {
+    /**
+     * Словарь: `id` → `webPath`. ID, для которых миниатюру не удалось
+     * сгенерировать, в словаре отсутствуют.
+     */
+    thumbnails: Record<string, string>;
 }
 export interface CapacitorMediastorePlugin {
     /**
@@ -111,6 +140,12 @@ export interface CapacitorMediastorePlugin {
     getMedia(options: GetMediaOptions): Promise<GetMediaResult>;
     /**
      * Генерирует миниатюру для указанного медиафайла (Lazy Load).
+     * По умолчанию возвращает `webPath` (file URL), что значительно быстрее, чем Base64.
      */
     getThumbnail(options: GetThumbnailOptions): Promise<GetThumbnailResult>;
+    /**
+     * Пакетная генерация миниатюр (Lazy Load для виртуализированных списков).
+     * Один нативный вызов = N миниатюр, что устраняет overhead на JS-мост.
+     */
+    getThumbnails(options: GetThumbnailsOptions): Promise<GetThumbnailsResult>;
 }

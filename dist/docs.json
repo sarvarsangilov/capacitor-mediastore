@@ -72,12 +72,31 @@
         ],
         "returns": "Promise<GetThumbnailResult>",
         "tags": [],
-        "docs": "Генерирует миниатюру для указанного медиафайла (Lazy Load).",
+        "docs": "Генерирует миниатюру для указанного медиафайла (Lazy Load).\nПо умолчанию возвращает `webPath` (file URL), что значительно быстрее, чем Base64.",
         "complexTypes": [
           "GetThumbnailResult",
           "GetThumbnailOptions"
         ],
         "slug": "getthumbnail"
+      },
+      {
+        "name": "getThumbnails",
+        "signature": "(options: GetThumbnailsOptions) => Promise<GetThumbnailsResult>",
+        "parameters": [
+          {
+            "name": "options",
+            "docs": "",
+            "type": "GetThumbnailsOptions"
+          }
+        ],
+        "returns": "Promise<GetThumbnailsResult>",
+        "tags": [],
+        "docs": "Пакетная генерация миниатюр (Lazy Load для виртуализированных списков).\nОдин нативный вызов = N миниатюр, что устраняет overhead на JS-мост.",
+        "complexTypes": [
+          "GetThumbnailsResult",
+          "GetThumbnailsOptions"
+        ],
+        "slug": "getthumbnails"
       }
     ],
     "properties": []
@@ -173,7 +192,7 @@
         {
           "name": "coverThumbnailWebPath",
           "tags": [],
-          "docs": "URL миниатюры обложки (кэшированный файл ~300px), высокопроизводительный, для списков",
+          "docs": "URL миниатюры обложки (кэшированный файл ~256px), высокопроизводительный, для списков",
           "complexTypes": [],
           "type": "string | null"
         }
@@ -358,9 +377,16 @@
       "methods": [],
       "properties": [
         {
+          "name": "webPath",
+          "tags": [],
+          "docs": "URL для использования в `<img src>` (`https://localhost/_capacitor_file_/...`\nна Android, `capacitor://localhost/_capacitor_file_/...` на iOS).\nПустая строка, если миниатюру не удалось сгенерировать.",
+          "complexTypes": [],
+          "type": "string"
+        },
+        {
           "name": "base64String",
           "tags": [],
-          "docs": "Base64 строка изображения (с префиксом data:image/jpeg;base64,...)",
+          "docs": "Base64-data-URL (`data:image/jpeg;base64,...`). Пустая строка, если\n`returnBase64` не был запрошен.",
           "complexTypes": [],
           "type": "string"
         }
@@ -379,6 +405,61 @@
           "docs": "ID медиафайла",
           "complexTypes": [],
           "type": "string"
+        },
+        {
+          "name": "returnBase64",
+          "tags": [],
+          "docs": "Если `true` — дополнительно вернуть `base64String` (legacy / fallback).\nПо умолчанию `false` — возвращается только `webPath`, что в разы быстрее.",
+          "complexTypes": [],
+          "type": "boolean | undefined"
+        },
+        {
+          "name": "size",
+          "tags": [],
+          "docs": "Сторона квадратной миниатюры в пикселях. По умолчанию 256.",
+          "complexTypes": [],
+          "type": "number | undefined"
+        }
+      ]
+    },
+    {
+      "name": "GetThumbnailsResult",
+      "slug": "getthumbnailsresult",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "thumbnails",
+          "tags": [],
+          "docs": "Словарь: `id` → `webPath`. ID, для которых миниатюру не удалось\nсгенерировать, в словаре отсутствуют.",
+          "complexTypes": [
+            "Record"
+          ],
+          "type": "Record<string, string>"
+        }
+      ]
+    },
+    {
+      "name": "GetThumbnailsOptions",
+      "slug": "getthumbnailsoptions",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "ids",
+          "tags": [],
+          "docs": "Массив ID медиафайлов",
+          "complexTypes": [],
+          "type": "string[]"
+        },
+        {
+          "name": "size",
+          "tags": [],
+          "docs": "Сторона квадратной миниатюры в пикселях. По умолчанию 256.",
+          "complexTypes": [],
+          "type": "number | undefined"
         }
       ]
     }
@@ -428,6 +509,20 @@
         {
           "text": "'all'",
           "complexTypes": []
+        }
+      ]
+    },
+    {
+      "name": "Record",
+      "slug": "record",
+      "docs": "Construct a type with a set of properties K of type T",
+      "types": [
+        {
+          "text": "{\r\n    [P in K]: T;\r\n}",
+          "complexTypes": [
+            "K",
+            "T"
+          ]
         }
       ]
     }

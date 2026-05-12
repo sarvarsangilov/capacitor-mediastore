@@ -8,6 +8,8 @@ import type {
   GetMediaResult,
   GetThumbnailOptions,
   GetThumbnailResult,
+  GetThumbnailsOptions,
+  GetThumbnailsResult,
   MediaItem,
   Album,
 } from './definitions';
@@ -24,6 +26,15 @@ function fakeDate(daysAgo: number): string {
   const d = new Date();
   d.setDate(d.getDate() - daysAgo);
   return d.toISOString();
+}
+
+/** Грей-плейсхолдер 1x1 PNG (для legacy returnBase64). */
+const MOCK_BASE64 =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+
+/** Картинка-заглушка для webPath на вебе. */
+function mockThumbWebPath(id: string, size = 256): string {
+  return `https://picsum.photos/seed/${encodeURIComponent(id)}/${size}/${size}`;
 }
 
 /**
@@ -145,10 +156,18 @@ export class CapacitorMediastoreWeb extends WebPlugin implements CapacitorMedias
   // ── Lazy Thumbnails ──────────────────────────────────────────────────────
 
   async getThumbnail(options: GetThumbnailOptions): Promise<GetThumbnailResult> {
-    // Возвращаем серый квадрат 256x256 в base64
-    options
-    const base64String =
-      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAACZElEQVR42u3UMQEAMAjAsKF0BwLwf4EBHJBI6NH4Wf2Ak8IAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAMAADAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAwAAMAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAMwADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMAAxABjAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADADYDD91MR8IN1oiAAAAAElFTkSuQmCC';
-    return { base64String };
+    const size = options.size ?? 256;
+    const webPath = mockThumbWebPath(options.id, size);
+    const base64String = options.returnBase64 ? MOCK_BASE64 : '';
+    return { webPath, base64String };
+  }
+
+  async getThumbnails(options: GetThumbnailsOptions): Promise<GetThumbnailsResult> {
+    const size = options.size ?? 256;
+    const thumbnails: Record<string, string> = {};
+    for (const id of options.ids) {
+      thumbnails[id] = mockThumbWebPath(id, size);
+    }
+    return { thumbnails };
   }
 }

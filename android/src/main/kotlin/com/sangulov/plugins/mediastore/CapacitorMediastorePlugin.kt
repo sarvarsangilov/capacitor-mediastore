@@ -11,6 +11,11 @@ import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
 import com.getcapacitor.annotation.Permission
 import com.getcapacitor.annotation.PermissionCallback
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 /**
  * CapacitorMediastorePlugin — Capacitor 8.x plugin для доступа к медиагалерее.
@@ -19,6 +24,9 @@ import com.getcapacitor.annotation.PermissionCallback
  *  - Android 14+ (API 34): READ_MEDIA_IMAGES, READ_MEDIA_VIDEO, READ_MEDIA_VISUAL_USER_SELECTED
  *  - Android 13  (API 33): READ_MEDIA_IMAGES, READ_MEDIA_VIDEO
  *  - Android 10–12 (API 29–32): READ_EXTERNAL_STORAGE
+ *
+ * Все тяжёлые методы запускаются в [Dispatchers.IO], чтобы не блокировать
+ * bridge-поток Capacitor и не вызывать ANR на больших галереях.
  */
 @CapacitorPlugin(
     name = "CapacitorMediastore",
@@ -42,10 +50,16 @@ import com.getcapacitor.annotation.PermissionCallback
 class CapacitorMediastorePlugin : Plugin() {
 
     private lateinit var mediaGallery: MediaGallery
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun load() {
         super.load()
         mediaGallery = MediaGallery(context)
+    }
+
+    override fun handleOnDestroy() {
+        scope.cancel()
+        super.handleOnDestroy()
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -154,11 +168,12 @@ class CapacitorMediastorePlugin : Plugin() {
 
     @PluginMethod
     fun getAlbums(call: PluginCall) {
-        try {
-            val result = mediaGallery.getAlbums()
-            call.resolve(result)
-        } catch (e: Exception) {
-            call.reject("Failed to get albums: ${e.message}", e)
+        scope.launch {
+            try {
+                call.resolve(mediaGallery.getAlbums())
+            } catch (e: Exception) {
+                call.reject("Failed to get albums: ${e.message}", e)
+            }
         }
     }
 
@@ -168,31 +183,60 @@ class CapacitorMediastorePlugin : Plugin() {
 
     @PluginMethod
     fun getMedia(call: PluginCall) {
-        try {
-            val albumId = call.getString("albumId")
-            val limit = call.getInt("limit", 20) ?: 20
-            val offset = call.getInt("offset", 0) ?: 0
-            val type = call.getString("type", "all") ?: "all"
+        val albumId = call.getString("albumId")
+        val limit = call.getInt("limit", 20) ?: 20
+        val offset = call.getInt("offset", 0) ?: 0
+        val type = call.getString("type", "all") ?: "all"
 
-            val result = mediaGallery.getMedia(albumId, limit, offset, type)
-            call.resolve(result)
-        } catch (e: Exception) {
-            call.reject("Failed to get media: ${e.message}", e)
+        scope.launch {
+            try {
+                call.resolve(mediaGallery.getMedia(albumId, limit, offset, type))
+            } catch (e: Exception) {
+                call.reject("Failed to get media: ${e.message}", e)
+            }
         }
     }
 
     @PluginMethod
     fun getThumbnail(call: PluginCall) {
-        try {
-            val id = call.getString("id")
-            if (id == null) {
-                call.reject("Must provide id")
-                return
+        val id = call.getString("id")
+        if (id == null) {
+            call.reject("Must provide id")
+            return
+        }
+        val returnBase64 = call.getBoolean("returnBase64", false) ?: false
+        val size = call.getInt("size", 256) ?: 256
+
+        scope.launch {
+            try {
+                call.resolve(mediaGallery.getThumbnail(id, returnBase64, size))
+            } catch (e: Exception) {
+                call.reject("Failed to get thumbnail: ${e.message}", e)
             }
-            val result = mediaGallery.getThumbnail(id)
-            call.resolve(result)
+        }
+    }
+
+    @PluginMethod
+    fun getThumbnails(call: PluginCall) {
+        val idsArr = call.getArray("ids")
+        if (idsArr == null) {
+            call.reject("Must provide ids")
+            return
+        }
+        val ids = try {
+            (0 until idsArr.length()).mapNotNull { idsArr.getString(it) }
         } catch (e: Exception) {
-            call.reject("Failed to get thumbnail: ${e.message}", e)
+            call.reject("Invalid ids array", e)
+            return
+        }
+        val size = call.getInt("size", 256) ?: 256
+
+        scope.launch {
+            try {
+                call.resolve(mediaGallery.getThumbnails(ids, size))
+            } catch (e: Exception) {
+                call.reject("Failed to get thumbnails: ${e.message}", e)
+            }
         }
     }
 }

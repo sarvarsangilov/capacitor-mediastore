@@ -17,6 +17,12 @@ var capacitorCapacitorMediastore = (function (exports, core) {
         d.setDate(d.getDate() - daysAgo);
         return d.toISOString();
     }
+    /** Грей-плейсхолдер 1x1 PNG (для legacy returnBase64). */
+    const MOCK_BASE64 = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+    /** Картинка-заглушка для webPath на вебе. */
+    function mockThumbWebPath(id, size = 256) {
+        return `https://picsum.photos/seed/${encodeURIComponent(id)}/${size}/${size}`;
+    }
     /**
      * Набор фейковых альбомов для веб-среды.
      */
@@ -123,8 +129,20 @@ var capacitorCapacitorMediastore = (function (exports, core) {
         }
         // ── Lazy Thumbnails ──────────────────────────────────────────────────────
         async getThumbnail(options) {
-            const base64String = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAACZElEQVR42u3UMQEAMAjAsKF0BwLwf4EBHJBI6NH4Wf2Ak8IAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAMAADAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAwAAMAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAMwADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMAAxABjAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMADAAwAAAAwAMAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwAMADAAAADAAwADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADAAwAMAAAAMADADYDD91MR8IN1oiAAAAAElFTkSuQmCC';
-            return { base64String };
+            var _a;
+            const size = (_a = options.size) !== null && _a !== void 0 ? _a : 256;
+            const webPath = mockThumbWebPath(options.id, size);
+            const base64String = options.returnBase64 ? MOCK_BASE64 : '';
+            return { webPath, base64String };
+        }
+        async getThumbnails(options) {
+            var _a;
+            const size = (_a = options.size) !== null && _a !== void 0 ? _a : 256;
+            const thumbnails = {};
+            for (const id of options.ids) {
+                thumbnails[id] = mockThumbWebPath(id, size);
+            }
+            return { thumbnails };
         }
     }
 

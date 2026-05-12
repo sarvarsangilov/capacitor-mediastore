@@ -7,13 +7,20 @@ import android.database.Cursor
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.provider.MediaStore
 import android.util.Base64
 import android.util.Size
 import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -22,12 +29,22 @@ import java.util.TimeZone
 
 /**
  * MediaGallery — бизнес-логика доступа к медиагалерее устройства.
+ *
+ * Все публичные методы — `suspend`, чтобы вызывающий плагин запускал их в
+ * `Dispatchers.IO` и не блокировал bridge-поток Capacitor.
  */
 class MediaGallery(private val context: Context) {
 
     private val contentResolver: ContentResolver = context.contentResolver
 
+    /** Папка для кешированных миниатюр (внутри cacheDir; Android сам её чистит). */
+    private val thumbDir: File by lazy {
+        File(context.cacheDir, "mediastore_thumbs").apply { if (!exists()) mkdirs() }
+    }
+
     companion object {
+        private const val DEFAULT_THUMB_SIZE = 256
+
         private val isoFormat: SimpleDateFormat
             get() = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
                 timeZone = TimeZone.getTimeZone("UTC")
@@ -38,41 +55,40 @@ class MediaGallery(private val context: Context) {
     // API
     // ────────────────────────────────────────────────────────────────────────
 
-    fun getAlbums(): JSObject {
+    suspend fun getAlbums(): JSObject = withContext(Dispatchers.IO) {
         val albums = mutableMapOf<String, AlbumInfo>()
 
         queryAlbumsFrom(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, albums, false)
         queryAlbumsFrom(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, albums, true)
 
-        val result = JSObject()
         val arr = JSArray()
-        for ((_, info) in albums) {
+        // Параллельно генерируем обложки альбомов (по 4 одновременно через IO-пул)
+        val coverPaths: Map<String, String?> = coroutineScope {
+            albums.values.map { info ->
+                async(Dispatchers.IO) {
+                    val path = if (info.coverUri != null && info.coverId != null) {
+                        getOrCreateThumbnailFile(info.coverId, info.coverUri, info.coverIsVideo, DEFAULT_THUMB_SIZE)
+                    } else null
+                    info.id to path
+                }
+            }.awaitAll().toMap()
+        }
+
+        for (info in albums.values) {
             val obj = JSObject()
             obj.put("id", info.id)
             obj.put("title", info.title)
             obj.put("count", info.count)
             obj.put("coverUri", info.coverUri)
             obj.put("coverWebPath", info.coverUri?.let { contentUriToWebPath(it) })
-            
-            // Для альбомов пока оставим генерацию (или сделать тоже ленивой?), 
-            // но в задаче просили Lazy Loading для getMedia. 
-            // Оставим пока генерацию для coverThumbnailWebPath, так как для альбомов их немного.
-            // Но используем Base64? Нет, в альбомах оставим как файл, так как их мало.
-            // Или если нужно Base64... Оставим старую логику (файл) для альбомов, чтобы не ломать.
-            val thumbPath = if (info.coverUri != null && info.coverId != null) {
-                 getOrCreateThumbnailFile(info.coverId, info.coverUri, info.coverIsVideo)
-            } else {
-                null
-            }
-            obj.put("coverThumbnailWebPath", thumbPath)
-            
+            obj.put("coverThumbnailWebPath", coverPaths[info.id])
             arr.put(obj)
         }
-        result.put("albums", arr)
-        return result
+
+        JSObject().apply { put("albums", arr) }
     }
 
-    fun getMedia(albumId: String?, limit: Int, offset: Int, type: String): JSObject {
+    suspend fun getMedia(albumId: String?, limit: Int, offset: Int, type: String): JSObject = withContext(Dispatchers.IO) {
         val collections = when (type) {
             "photo" -> listOf(CollectionInfo(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "photo"))
             "video" -> listOf(CollectionInfo(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, "video"))
@@ -82,63 +98,73 @@ class MediaGallery(private val context: Context) {
             )
         }
 
-        val allItems = mutableListOf<JSObject>()
-        var totalCount = 0
+        // 1. total — считаем дёшево, без выборки.
+        var total = 0
+        for (col in collections) total += countMedia(col.uri, albumId)
 
-        for (col in collections) {
-            totalCount += countMedia(col.uri, albumId)
-            queryMedia(col.uri, col.type, albumId, allItems)
+        // 2. Каждая коллекция отдаёт уже отсортированный курсор с лимитом (offset+limit).
+        //    Затем сливаем два отсортированных потока merge-sort'ом по dateAdded и
+        //    выкидываем первые `offset` элементов, оставляя `limit`.
+        val perCollectionTake = offset + limit
+        val streams: List<List<JSObject>> = collections.map { col ->
+            queryMediaPage(col.uri, col.type, albumId, perCollectionTake)
         }
+        val merged = mergeByCreatedAtDesc(streams)
+        val end = minOf(offset + limit, merged.size)
+        val page = if (offset < merged.size) merged.subList(offset, end) else emptyList()
 
-        allItems.sortByDescending { it.optString("createdAt", "") }
-
-        val end = minOf(offset + limit, allItems.size)
-        val page = if (offset < allItems.size) allItems.subList(offset, end) else emptyList()
-
-        val result = JSObject()
         val arr = JSArray()
         for (item in page) arr.put(item)
-        result.put("media", arr)
-        result.put("total", totalCount)
-        result.put("hasMore", offset + limit < totalCount)
-        return result
+
+        JSObject().apply {
+            put("media", arr)
+            put("total", total)
+            put("hasMore", offset + limit < total)
+        }
     }
 
     /**
-     * Lazy load thumbnails: getThumbnail generates Base64 string on demand.
+     * Lazy load thumbnail: возвращает webPath (file URL) и опционально base64.
      */
-    fun getThumbnail(id: String): JSObject {
+    suspend fun getThumbnail(id: String, returnBase64: Boolean, size: Int): JSObject = withContext(Dispatchers.IO) {
         val mediaId = id.toLongOrNull() ?: throw IllegalArgumentException("Invalid ID")
         val (uri, isVideo) = getUriAndType(mediaId) ?: throw IllegalArgumentException("Media not found")
-        
-        val bitmap = try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                contentResolver.loadThumbnail(uri, Size(256, 256), null)
-            } else {
-                if (isVideo) {
-                    @Suppress("DEPRECATION")
-                    MediaStore.Video.Thumbnails.getThumbnail(contentResolver, mediaId, MediaStore.Video.Thumbnails.MINI_KIND, null)
-                } else {
-                    @Suppress("DEPRECATION")
-                    MediaStore.Images.Thumbnails.getThumbnail(contentResolver, mediaId, MediaStore.Images.Thumbnails.MINI_KIND, null)
+
+        val effectiveSize = if (size > 0) size else DEFAULT_THUMB_SIZE
+        val webPath = getOrCreateThumbnailFile(mediaId, uri.toString(), isVideo, effectiveSize) ?: ""
+        val base64 = if (returnBase64 && webPath.isNotEmpty()) readCachedAsBase64DataUrl(mediaId, effectiveSize) else ""
+
+        JSObject().apply {
+            put("webPath", webPath)
+            put("base64String", base64)
+        }
+    }
+
+    /**
+     * Пакетная генерация миниатюр — один нативный вызов, N параллельных IO-задач.
+     * Возвращает `{ thumbnails: { id: webPath } }`. Невалидные id пропускаются молча.
+     */
+    suspend fun getThumbnails(ids: List<String>, size: Int): JSObject = withContext(Dispatchers.IO) {
+        val effectiveSize = if (size > 0) size else DEFAULT_THUMB_SIZE
+
+        val results: List<Pair<String, String?>> = coroutineScope {
+            ids.map { rawId ->
+                async(Dispatchers.IO) {
+                    val mediaId = rawId.toLongOrNull() ?: return@async rawId to null
+                    val info = getUriAndType(mediaId) ?: return@async rawId to null
+                    val path = try {
+                        getOrCreateThumbnailFile(mediaId, info.first.toString(), info.second, effectiveSize)
+                    } catch (_: Exception) { null }
+                    rawId to path
                 }
-            }
-        } catch (e: Exception) {
-            null
+            }.awaitAll()
         }
 
-        val result = JSObject()
-        if (bitmap != null) {
-            val outputStream = ByteArrayOutputStream()
-            // Quality 60-70% as requested
-            bitmap.compress(Bitmap.CompressFormat.JPEG, 70, outputStream)
-            val byteArray = outputStream.toByteArray()
-            val base64 = Base64.encodeToString(byteArray, Base64.NO_WRAP)
-            result.put("base64String", "data:image/jpeg;base64,$base64")
-        } else {
-            result.put("base64String", "")
+        val map = JSObject()
+        for ((rawId, path) in results) {
+            if (!path.isNullOrEmpty()) map.put(rawId, path)
         }
-        return result
+        JSObject().apply { put("thumbnails", map) }
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -150,7 +176,7 @@ class MediaGallery(private val context: Context) {
         val args = arrayOf(id.toString())
         val projection = arrayOf(MediaStore.Files.FileColumns.MEDIA_TYPE)
         val collection = MediaStore.Files.getContentUri("external")
-        
+
         contentResolver.query(collection, projection, selection, args, null)?.use { cursor ->
              if (cursor.moveToFirst()) {
                  val typeIdx = cursor.getColumnIndex(MediaStore.Files.FileColumns.MEDIA_TYPE)
@@ -206,17 +232,72 @@ class MediaGallery(private val context: Context) {
         return 0
     }
 
-    private fun queryMedia(collection: Uri, mediaType: String, albumId: String?, outList: MutableList<JSObject>) {
+    /**
+     * Курсор-страница, отсортированная по DATE_ADDED DESC, ограниченная сверху.
+     * На API 30+ — через `QUERY_ARG_*` (нативный SQL LIMIT). На API < 30 — fallback
+     * на старый `sortOrder = "... LIMIT N"`, который MediaStore исторически принимает.
+     */
+    private fun queryMediaPage(collection: Uri, mediaType: String, albumId: String?, take: Int): List<JSObject> {
+        val out = mutableListOf<JSObject>()
         val projection = buildMediaProjection(mediaType)
-        val selection = albumId?.let { "${MediaStore.MediaColumns.BUCKET_ID} = ?" }
-        val selectionArgs = albumId?.let { arrayOf(it) }
-        val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC"
 
-        contentResolver.query(collection, projection, selection, selectionArgs, sortOrder)?.use { cursor ->
-            while (cursor.moveToNext()) {
-                outList.add(cursorToMediaItem(cursor, collection, mediaType))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val args = Bundle().apply {
+                if (!albumId.isNullOrEmpty()) {
+                    putString(ContentResolver.QUERY_ARG_SQL_SELECTION, "${MediaStore.MediaColumns.BUCKET_ID} = ?")
+                    putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, arrayOf(albumId))
+                }
+                putStringArray(
+                    ContentResolver.QUERY_ARG_SORT_COLUMNS,
+                    arrayOf(MediaStore.MediaColumns.DATE_ADDED)
+                )
+                putInt(
+                    ContentResolver.QUERY_ARG_SORT_DIRECTION,
+                    ContentResolver.QUERY_SORT_DIRECTION_DESCENDING
+                )
+                putInt(ContentResolver.QUERY_ARG_LIMIT, take)
+                putInt(ContentResolver.QUERY_ARG_OFFSET, 0)
+            }
+            contentResolver.query(collection, projection, args, null)?.use { cursor ->
+                while (cursor.moveToNext()) out.add(cursorToMediaItem(cursor, collection, mediaType))
+            }
+        } else {
+            // Legacy: SQL LIMIT, склеенный в sortOrder. MediaStore это исторически принимает.
+            val selection = albumId?.let { "${MediaStore.MediaColumns.BUCKET_ID} = ?" }
+            val selectionArgs = albumId?.let { arrayOf(it) }
+            val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC LIMIT $take"
+            contentResolver.query(collection, projection, selection, selectionArgs, sortOrder)?.use { cursor ->
+                while (cursor.moveToNext()) out.add(cursorToMediaItem(cursor, collection, mediaType))
             }
         }
+        return out
+    }
+
+    /**
+     * Сливает несколько уже-DESC-отсортированных списков в один DESC-список по `createdAt`.
+     * Каждый stream должен быть отсортирован по убыванию (как и возвращает queryMediaPage).
+     */
+    private fun mergeByCreatedAtDesc(streams: List<List<JSObject>>): List<JSObject> {
+        if (streams.size == 1) return streams[0]
+        val cursors = IntArray(streams.size)
+        val totalSize = streams.sumOf { it.size }
+        val result = ArrayList<JSObject>(totalSize)
+        while (true) {
+            var bestIdx = -1
+            var bestKey: String? = null
+            for (i in streams.indices) {
+                if (cursors[i] >= streams[i].size) continue
+                val key = streams[i][cursors[i]].optString("createdAt", "")
+                if (bestKey == null || key > bestKey) {
+                    bestKey = key
+                    bestIdx = i
+                }
+            }
+            if (bestIdx == -1) break
+            result.add(streams[bestIdx][cursors[bestIdx]])
+            cursors[bestIdx]++
+        }
+        return result
     }
 
     private fun buildMediaProjection(mediaType: String): Array<String> {
@@ -281,11 +362,20 @@ class MediaGallery(private val context: Context) {
         }
     }
 
-    private fun getOrCreateThumbnailFile(mediaId: Long, contentUriStr: String, isVideo: Boolean): String? {
-        // Used for ALBUMS mostly now, keeping file-based approach for consistency in getAlbums
-        val cacheDir = context.cacheDir
-        val thumbFile = File(cacheDir, "thumb_$mediaId.jpg")
-        if (thumbFile.exists()) return "https://localhost/_capacitor_file_" + thumbFile.absolutePath
+    /**
+     * Возвращает webPath к закешированному файлу миниатюры (или null, если не удалось сгенерировать).
+     * Кеш именован по `<mediaId>_<size>.jpg`, что позволяет хранить несколько размеров параллельно.
+     */
+    private fun getOrCreateThumbnailFile(
+        mediaId: Long,
+        contentUriStr: String,
+        isVideo: Boolean,
+        size: Int = DEFAULT_THUMB_SIZE
+    ): String? {
+        val thumbFile = File(thumbDir, "thumb_${mediaId}_${size}.jpg")
+        if (thumbFile.exists() && thumbFile.length() > 0) {
+            return "https://localhost/_capacitor_file_" + thumbFile.absolutePath
+        }
 
         try {
             val contentUri = Uri.parse(contentUriStr)
@@ -293,8 +383,8 @@ class MediaGallery(private val context: Context) {
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 try {
-                    bitmap = contentResolver.loadThumbnail(contentUri, Size(300, 300), null)
-                } catch (e: Exception) { }
+                    bitmap = contentResolver.loadThumbnail(contentUri, Size(size, size), null)
+                } catch (_: Exception) { }
             }
             if (bitmap == null) {
                  if (isVideo) {
@@ -310,8 +400,29 @@ class MediaGallery(private val context: Context) {
                 FileOutputStream(thumbFile).use { out -> bitmap.compress(Bitmap.CompressFormat.JPEG, 70, out) }
                 return "https://localhost/_capacitor_file_" + thumbFile.absolutePath
             }
-        } catch (e: Exception) { }
+        } catch (_: Exception) { }
         return null
+    }
+
+    /**
+     * Считывает уже сгенерированный кеш-файл и возвращает `data:image/jpeg;base64,...`.
+     * Используется только если клиент явно запросил `returnBase64=true`.
+     */
+    private fun readCachedAsBase64DataUrl(mediaId: Long, size: Int): String {
+        val thumbFile = File(thumbDir, "thumb_${mediaId}_${size}.jpg")
+        if (!thumbFile.exists()) return ""
+        return try {
+            FileInputStream(thumbFile).use { fis ->
+                val baos = ByteArrayOutputStream(thumbFile.length().toInt().coerceAtLeast(1024))
+                val buf = ByteArray(8 * 1024)
+                while (true) {
+                    val n = fis.read(buf); if (n <= 0) break
+                    baos.write(buf, 0, n)
+                }
+                val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+                "data:image/jpeg;base64,$b64"
+            }
+        } catch (_: Exception) { "" }
     }
 
     private fun Cursor.getStringOrNull(columnName: String): String? {
