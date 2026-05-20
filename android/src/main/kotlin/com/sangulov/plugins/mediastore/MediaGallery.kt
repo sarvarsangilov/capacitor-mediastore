@@ -505,9 +505,11 @@ class MediaGallery(private val context: Context) {
 
         // Sort + limit. На API 26+ можно использовать Bundle-аргументы.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            // На Android 11+ (R+) `QUERY_ARG_SQL_SORT_ORDER` для MediaStore
-            // может молча игнорироваться — используем структурированную форму
-            // с multi-column sort через `QUERY_ARG_SORT_COLUMNS`.
+            // ВАЖНО: только ОДНА колонка в QUERY_ARG_SORT_COLUMNS.
+            // Multi-column sort через структурированный API MediaStore-провайдер
+            // молча игнорирует на ряде Android-версий — приходит дефолтный порядок
+            // (ASC по _id), что ломает merge-сортировку. Tie-breaker по _id для
+            // cursor-пагинации обеспечивается на уровне SQL WHERE, см. cursor-логику.
             val args = Bundle().apply {
                 if (selection != null) {
                     putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selection)
@@ -515,7 +517,7 @@ class MediaGallery(private val context: Context) {
                 }
                 putStringArray(
                     ContentResolver.QUERY_ARG_SORT_COLUMNS,
-                    arrayOf(MediaStore.MediaColumns.DATE_ADDED, MediaStore.MediaColumns._ID)
+                    arrayOf(MediaStore.MediaColumns.DATE_ADDED)
                 )
                 putInt(
                     ContentResolver.QUERY_ARG_SORT_DIRECTION,
@@ -529,7 +531,7 @@ class MediaGallery(private val context: Context) {
                 while (c.moveToNext()) out.add(cursorToMediaItem(c, collection, mediaType))
             }
         } else {
-            val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC, ${MediaStore.MediaColumns._ID} DESC LIMIT $take"
+            val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC LIMIT $take"
             contentResolver.query(collection, projection, selection, selectionArgs, sortOrder)?.use { c ->
                 Log.d(TAG, "queryMediaPage[$mediaType] (legacy): cursor=${c.count} rows, take=$take")
                 while (c.moveToNext()) out.add(cursorToMediaItem(c, collection, mediaType))
