@@ -6,6 +6,7 @@ import android.content.Context
 import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -654,17 +655,21 @@ class MediaGallery(private val context: Context) {
                     }
                 } catch (_: Exception) { }
             }
-            if (bitmap == null && !isAudio) {
+            if (bitmap == null && isVideo) {
+                // Надёжный fallback для видео: вытаскиваем кадр через
+                // MediaMetadataRetriever. Срабатывает даже когда у MediaStore нет
+                // предсгенерированной превьюшки (loadThumbnail в этом случае
+                // бросает FileNotFoundException, которая ловится Android'ом и
+                // громко логгируется системой, даже если мы её catch'нули).
+                bitmap = extractVideoFrame(contentUri, size)
+            }
+            if (bitmap == null && !isAudio && !isVideo && Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                // Legacy image thumbnails только для очень старых Android.
+                // На Q+ это deprecated и flaky.
                 @Suppress("DEPRECATION")
-                bitmap = if (isVideo) {
-                    MediaStore.Video.Thumbnails.getThumbnail(
-                        contentResolver, mediaId, MediaStore.Video.Thumbnails.MINI_KIND, null
-                    )
-                } else {
-                    MediaStore.Images.Thumbnails.getThumbnail(
-                        contentResolver, mediaId, MediaStore.Images.Thumbnails.MINI_KIND, null
-                    )
-                }
+                bitmap = MediaStore.Images.Thumbnails.getThumbnail(
+                    contentResolver, mediaId, MediaStore.Images.Thumbnails.MINI_KIND, null
+                )
             }
 
             if (bitmap != null) {
@@ -675,6 +680,37 @@ class MediaGallery(private val context: Context) {
             }
         } catch (_: Exception) { }
         return null
+    }
+
+    /**
+     * Вытаскивает один кадр из видео через MediaMetadataRetriever и масштабирует
+     * под нужный `size`. Возвращает `null`, если видео битое / закрыто / в облаке
+     * без локальной копии.
+     *
+     * Используется как fallback после неудачного `loadThumbnail`.
+     */
+    private fun extractVideoFrame(uri: Uri, size: Int): Bitmap? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(context, uri)
+            // Берём кадр на 1-й секунде через CLOSEST_SYNC — даёт ключевой кадр
+            // быстро и без артефактов B-frame'ов.
+            val raw: Bitmap? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                retriever.getScaledFrameAtTime(
+                    1_000_000L,
+                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                    size, size
+                )
+            } else {
+                retriever.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            }
+            // Если первый кадр не сошёл — пробуем «любой кадр» без time-преференса.
+            raw ?: retriever.getFrameAtTime(-1L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+        } catch (_: Exception) {
+            null
+        } finally {
+            try { retriever.release() } catch (_: Exception) { }
+        }
     }
 
     private fun readCachedAsBase64DataUrl(mediaId: Long, size: Int): String {
