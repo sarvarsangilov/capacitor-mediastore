@@ -308,7 +308,13 @@ class MediaGallery(private val context: Context) {
                     thumbnailSemaphore.withPermit {
                         if (!isActive) return@async rawId to null
                         val mediaId = rawId.toLongOrNull() ?: return@async rawId to null
-                        val info = getUriAndType(mediaId) ?: return@async rawId to null
+                        val info = try {
+                            getUriAndType(mediaId)
+                        } catch (e: CancellationException) { throw e }
+                          catch (e: Exception) {
+                              Log.w(TAG, "getThumbnails: getUriAndType failed for id=$mediaId: ${e.message}")
+                              null
+                          } ?: return@async rawId to null
                         val path = try {
                             getOrCreateThumbnailFile(
                                 mediaId, info.uri.toString(), info.isVideo, effectiveSize, 1.0, info.isAudio, info.albumId
@@ -364,33 +370,68 @@ class MediaGallery(private val context: Context) {
 
     private data class MediaInfo(val uri: Uri, val isVideo: Boolean, val isAudio: Boolean, val albumId: Long?)
 
+    /**
+     * Определяет тип медиа (image / video / audio) по числовому ID.
+     * MediaStore.Files — унифицированная таблица всех файлов, но у неё **нет**
+     * audio-специфичных колонок (album_id и т.п.). Поэтому делаем два запроса:
+     *  1. Files → media_type (определяем категорию)
+     *  2. Audio → album_id (только если файл оказался audio)
+     */
     private fun getUriAndType(id: Long): MediaInfo? {
         val selection = "${MediaStore.MediaColumns._ID} = ?"
         val args = arrayOf(id.toString())
-        val projection = arrayOf(
-            MediaStore.Files.FileColumns.MEDIA_TYPE,
-            MediaStore.Audio.AudioColumns.ALBUM_ID
-        )
         val collection = MediaStore.Files.getContentUri("external")
+        val projection = arrayOf(MediaStore.Files.FileColumns.MEDIA_TYPE)
 
-        contentResolver.query(collection, projection, selection, args, null)?.use { cursor ->
-            if (cursor.moveToFirst()) {
-                val typeIdx = cursor.getColumnIndex(MediaStore.Files.FileColumns.MEDIA_TYPE)
-                if (typeIdx >= 0) {
-                    val type = cursor.getInt(typeIdx)
-                    val isVideo = (type == MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO)
-                    val isAudio = (type == MediaStore.Files.FileColumns.MEDIA_TYPE_AUDIO)
-                    val albumId = if (isAudio) cursor.getLongOrZero(MediaStore.Audio.AudioColumns.ALBUM_ID).takeIf { it > 0 } else null
-                    val contentUri = when {
-                        isVideo -> ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id)
-                        isAudio -> ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id)
-                        else -> ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+        var isVideo = false
+        var isAudio = false
+        var found = false
+
+        try {
+            contentResolver.query(collection, projection, selection, args, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val typeIdx = cursor.getColumnIndex(MediaStore.Files.FileColumns.MEDIA_TYPE)
+                    if (typeIdx >= 0) {
+                        val type = cursor.getInt(typeIdx)
+                        isVideo = (type == MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO)
+                        isAudio = (type == MediaStore.Files.FileColumns.MEDIA_TYPE_AUDIO)
+                        found = true
                     }
-                    return MediaInfo(contentUri, isVideo, isAudio, albumId)
                 }
             }
+        } catch (e: Exception) {
+            Log.w(TAG, "getUriAndType: Files query failed for id=$id: ${e.message}")
+            return null
         }
-        return null
+        if (!found) return null
+
+        val albumId: Long? = if (isAudio) queryAudioAlbumId(id) else null
+        val contentUri = when {
+            isVideo -> ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id)
+            isAudio -> ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id)
+            else -> ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+        }
+        return MediaInfo(contentUri, isVideo, isAudio, albumId)
+    }
+
+    /**
+     * Достаёт album_id для аудио-файла отдельным запросом в Audio-коллекцию.
+     */
+    private fun queryAudioAlbumId(id: Long): Long? {
+        return try {
+            val selection = "${MediaStore.MediaColumns._ID} = ?"
+            val args = arrayOf(id.toString())
+            val projection = arrayOf(MediaStore.Audio.AudioColumns.ALBUM_ID)
+            contentResolver.query(
+                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, projection, selection, args, null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(MediaStore.Audio.AudioColumns.ALBUM_ID)
+                    if (idx >= 0 && !cursor.isNull(idx)) return@use cursor.getLong(idx).takeIf { it > 0 }
+                }
+                null
+            }
+        } catch (_: Exception) { null }
     }
 
     private fun queryAlbumsFrom(collection: Uri, albums: MutableMap<String, AlbumInfo>, isVideo: Boolean) {
