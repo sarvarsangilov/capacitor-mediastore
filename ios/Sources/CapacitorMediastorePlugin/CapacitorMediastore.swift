@@ -1,13 +1,17 @@
 import Foundation
 import Photos
+import MediaPlayer
 import UIKit
 
 /**
- * MediaGallery — бизнес-логика доступа к фото/видео галерее на iOS.
+ * CapacitorMediastore — бизнес-логика iOS-плагина.
  *
- * Использует фреймворк Photos (PHAsset, PHAssetCollection, PHImageManager).
- * Все тяжёлые методы вызываются из `DispatchQueue.global(qos: .userInitiated)`
- * через bridge-плагин — на этой очереди и работают.
+ * Источники данных:
+ *  - Photos framework (`PHAsset`, `PHAssetCollection`) — фото и видео.
+ *  - MediaPlayer (`MPMediaQuery`, `MPMediaItem`) — аудио / музыка из системной
+ *    музыкальной библиотеки. Требует `NSAppleMusicUsageDescription` в Info.plist.
+ *
+ * Все тяжёлые операции вызываются с background-очередей через bridge-плагин.
  */
 @objc public class CapacitorMediastore: NSObject {
 
@@ -31,79 +35,83 @@ import UIKit
     // MARK: - Permissions
 
     @objc public func checkPermissions() -> [String: String] {
-        let status: PHAuthorizationStatus
+        let photoStatus: PHAuthorizationStatus
         if #available(iOS 14, *) {
-            status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+            photoStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         } else {
-            status = PHPhotoLibrary.authorizationStatus()
+            photoStatus = PHPhotoLibrary.authorizationStatus()
         }
-        return permissionResult(from: status)
+        let photoStr = mapPhotoStatus(photoStatus)
+        let audioStr = mapAudioStatus(MPMediaLibrary.authorizationStatus())
+        return ["photos": photoStr, "videos": photoStr, "audio": audioStr]
     }
 
     @objc public func requestPermissions(completion: @escaping ([String: String]) -> Void) {
+        let group = DispatchGroup()
+        var photoStr = "denied"
+        var audioStr = "denied"
+
+        group.enter()
         if #available(iOS 14, *) {
             PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
-                completion(self.permissionResult(from: status))
+                photoStr = self.mapPhotoStatus(status)
+                group.leave()
             }
         } else {
             PHPhotoLibrary.requestAuthorization { status in
-                completion(self.permissionResult(from: status))
+                photoStr = self.mapPhotoStatus(status)
+                group.leave()
             }
+        }
+
+        group.enter()
+        MPMediaLibrary.requestAuthorization { status in
+            audioStr = self.mapAudioStatus(status)
+            group.leave()
+        }
+
+        group.notify(queue: .global(qos: .userInitiated)) {
+            completion(["photos": photoStr, "videos": photoStr, "audio": audioStr])
         }
     }
 
-    private func permissionResult(from status: PHAuthorizationStatus) -> [String: String] {
-        let str: String
+    private func mapPhotoStatus(_ status: PHAuthorizationStatus) -> String {
         switch status {
-        case .authorized:
-            str = "granted"
-        case .limited:
-            str = "limited"
-        case .denied, .restricted:
-            str = "denied"
-        case .notDetermined:
-            str = "prompt"
-        @unknown default:
-            str = "prompt"
+        case .authorized: return "granted"
+        case .limited: return "limited"
+        case .denied, .restricted: return "denied"
+        case .notDetermined: return "prompt"
+        @unknown default: return "prompt"
         }
-        return ["photos": str, "videos": str]
+    }
+
+    private func mapAudioStatus(_ status: MPMediaLibraryAuthorizationStatus) -> String {
+        switch status {
+        case .authorized: return "granted"
+        case .denied, .restricted: return "denied"
+        case .notDetermined: return "prompt"
+        @unknown default: return "prompt"
+        }
     }
 
     // MARK: - Albums
 
-    /**
-     * Возвращает список альбомов с подсчётом и обложкой.
-     */
     @objc public func getAlbums(completion: @escaping ([[String: Any]]) -> Void) {
         let group = DispatchGroup()
         var allAlbums: [[String: Any]] = []
         let queue = DispatchQueue(label: "com.sangulov.plugins.mediastore.albums", attributes: .concurrent)
 
-        // Смарт-альбомы
         group.enter()
-        let smartAlbums = PHAssetCollection.fetchAssetCollections(
-            with: .smartAlbum,
-            subtype: .any,
-            options: nil
-        )
+        let smartAlbums = PHAssetCollection.fetchAssetCollections(with: .smartAlbum, subtype: .any, options: nil)
         self.collectAlbums(from: smartAlbums) { albums in
-            queue.async(flags: .barrier) {
-                allAlbums.append(contentsOf: albums)
-            }
+            queue.async(flags: .barrier) { allAlbums.append(contentsOf: albums) }
             group.leave()
         }
 
-        // Пользовательские альбомы
         group.enter()
-        let userAlbums = PHAssetCollection.fetchAssetCollections(
-            with: .album,
-            subtype: .any,
-            options: nil
-        )
+        let userAlbums = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .any, options: nil)
         self.collectAlbums(from: userAlbums) { albums in
-            queue.async(flags: .barrier) {
-                allAlbums.append(contentsOf: albums)
-            }
+            queue.async(flags: .barrier) { allAlbums.append(contentsOf: albums) }
             group.leave()
         }
 
@@ -112,9 +120,6 @@ import UIKit
         }
     }
 
-    /**
-     * Проходит по результатам fetch и возвращает альбомы с ненулевым количеством (асинхронно).
-     */
     private func collectAlbums(
         from fetchResult: PHFetchResult<PHAssetCollection>,
         completion: @escaping ([[String: Any]]) -> Void
@@ -123,55 +128,37 @@ import UIKit
         fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
 
         let count = fetchResult.count
-        guard count > 0 else {
-            completion([])
-            return
-        }
+        guard count > 0 else { completion([]); return }
 
         var albums: [Int: [String: Any]] = [:]
         let lock = NSLock()
-
         let group = DispatchGroup()
         let queue = DispatchQueue(label: "com.sangulov.plugins.mediastore.collect", attributes: .concurrent)
-
         let thumbSize = CGSize(width: Self.defaultThumbSize, height: Self.defaultThumbSize)
 
         for i in 0..<count {
             let collection = fetchResult.object(at: i)
             group.enter()
-
             queue.async {
                 let assets = PHAsset.fetchAssets(in: collection, options: fetchOptions)
                 let assetCount = assets.count
-                guard assetCount > 0 else {
-                    group.leave()
-                    return
-                }
+                guard assetCount > 0 else { group.leave(); return }
 
                 var coverUri: String? = nil
                 var coverThumbnailWebPath: String? = nil
-
                 let innerGroup = DispatchGroup()
                 var coverWebPath: String? = nil
 
                 if let firstAsset = assets.firstObject {
                     coverUri = "ph://\(firstAsset.localIdentifier)"
-
-                    // Резолвим webPath (оригинал) — асинхронно, ждём через innerGroup.
                     innerGroup.enter()
                     self.resolveWebPath(for: firstAsset) { path in
                         coverWebPath = path
                         innerGroup.leave()
                     }
-
-                    // Резолвим thumbnail (синхронно внутри функции через семафор) — file URL, не base64.
-                    coverThumbnailWebPath = self.getOrCreateThumbnailFile(
-                        asset: firstAsset,
-                        targetSize: thumbSize
-                    )
+                    coverThumbnailWebPath = self.getOrCreateThumbnailFile(asset: firstAsset, targetSize: thumbSize)
                 }
-
-                innerGroup.wait() // Ждем резолва оригинального пути
+                innerGroup.wait()
 
                 let album: [String: Any] = [
                     "id": collection.localIdentifier,
@@ -182,36 +169,41 @@ import UIKit
                     "coverThumbnailWebPath": coverThumbnailWebPath ?? NSNull()
                 ]
 
-                lock.lock()
-                albums[i] = album
-                lock.unlock()
-
+                lock.lock(); albums[i] = album; lock.unlock()
                 group.leave()
             }
         }
 
         group.notify(queue: .global(qos: .userInitiated)) {
-             // Собираем результаты в порядке исходного fetchResult
-             var result: [[String: Any]] = []
-             for i in 0..<count {
-                 lock.lock()
-                 let album = albums[i]
-                 lock.unlock()
-
-                 if let a = album {
-                     result.append(a)
-                 }
-             }
-             completion(result)
+            var result: [[String: Any]] = []
+            for i in 0..<count {
+                lock.lock(); let album = albums[i]; lock.unlock()
+                if let a = album { result.append(a) }
+            }
+            completion(result)
         }
     }
 
     // MARK: - Media
 
-    /**
-     * Возвращает медиафайлы с метаданными и путями.
-     */
     @objc public func getMedia(
+        albumId: String?,
+        limit: Int,
+        offset: Int,
+        type: String,
+        completion: @escaping ([String: Any]) -> Void
+    ) {
+        if type == "audio" {
+            getAudio(limit: limit, offset: offset, completion: completion)
+            return
+        }
+        getPhotosVideos(albumId: albumId, limit: limit, offset: offset, type: type, completion: completion)
+    }
+
+    /**
+     * Photo/Video через Photos framework.
+     */
+    private func getPhotosVideos(
         albumId: String?,
         limit: Int,
         offset: Int,
@@ -229,22 +221,17 @@ import UIKit
         default:
             fetchOptions.predicate = NSPredicate(
                 format: "mediaType == %d OR mediaType == %d",
-                PHAssetMediaType.image.rawValue,
-                PHAssetMediaType.video.rawValue
+                PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue
             )
         }
 
         let fetchResult: PHFetchResult<PHAsset>
         if let albumId = albumId, !albumId.isEmpty {
-            let collections = PHAssetCollection.fetchAssetCollections(
-                withLocalIdentifiers: [albumId],
-                options: nil
-            )
+            let collections = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [albumId], options: nil)
             if let collection = collections.firstObject {
                 fetchResult = PHAsset.fetchAssets(in: collection, options: fetchOptions)
             } else {
-                completion(["media": [], "total": 0, "hasMore": false])
-                return
+                completion(["media": [], "total": 0, "hasMore": false]); return
             }
         } else {
             fetchResult = PHAsset.fetchAssets(with: fetchOptions)
@@ -256,16 +243,13 @@ import UIKit
         let hasMore = safeOffset + safeLimit < total
 
         guard safeLimit > 0 else {
-            completion(["media": [], "total": total, "hasMore": hasMore])
-            return
+            completion(["media": [], "total": total, "hasMore": hasMore]); return
         }
 
         var items: [Int: [String: Any]] = [:]
         let lock = NSLock()
-
         let group = DispatchGroup()
         let queue = DispatchQueue(label: "com.sangulov.plugins.mediastore.processing", attributes: .concurrent)
-
         let range = safeOffset..<(safeOffset + safeLimit)
 
         for i in range {
@@ -274,18 +258,11 @@ import UIKit
             let index = i - safeOffset
 
             group.enter()
-
             queue.async {
                 var item = self.assetToItem(asset: asset)
-
-                // Получение webPath (асинхронно)
                 self.resolveWebPath(for: asset) { webPath in
                     item["webPath"] = webPath ?? NSNull()
-
-                    lock.lock()
-                    items[index] = item
-                    lock.unlock()
-
+                    lock.lock(); items[index] = item; lock.unlock()
                     group.leave()
                 }
             }
@@ -294,52 +271,81 @@ import UIKit
         group.notify(queue: .global(qos: .userInitiated)) {
             var sortedItems: [[String: Any]] = []
             for i in 0..<safeLimit {
-                lock.lock()
-                let item = items[i]
-                lock.unlock()
-
-                if let it = item {
-                    sortedItems.append(it)
-                }
+                lock.lock(); let item = items[i]; lock.unlock()
+                if let it = item { sortedItems.append(it) }
             }
             completion(["media": sortedItems, "total": total, "hasMore": hasMore])
         }
+    }
+
+    /**
+     * Audio через MPMediaQuery. Возвращает песни из системной библиотеки,
+     * отсортированные по дате добавления (`dateAdded`). Tracks из облака
+     * (Apple Music без локального файла) включаются с пустым `webPath`.
+     */
+    private func getAudio(
+        limit: Int,
+        offset: Int,
+        completion: @escaping ([String: Any]) -> Void
+    ) {
+        let query = MPMediaQuery.songs()
+        guard let items = query.items, !items.isEmpty else {
+            completion(["media": [], "total": 0, "hasMore": false]); return
+        }
+        // dateAdded доступен с iOS 10+ — сортируем DESC.
+        let sorted = items.sorted { (a, b) -> Bool in
+            return a.dateAdded > b.dateAdded
+        }
+
+        let total = sorted.count
+        let safeOffset = min(offset, total)
+        let safeLimit = min(limit, total - safeOffset)
+        let hasMore = safeOffset + safeLimit < total
+
+        guard safeLimit > 0 else {
+            completion(["media": [], "total": total, "hasMore": hasMore]); return
+        }
+
+        let slice = Array(sorted[safeOffset..<(safeOffset + safeLimit)])
+        let media = slice.map { audioItemToDictionary($0) }
+        completion(["media": media, "total": total, "hasMore": hasMore])
     }
 
     // ────────────────────────────────────────────────────────────────────────
     // Thumbnails (Lazy Load)
     // ────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Lazy load thumbnail: возвращает webPath (file URL) и опционально base64.
-     */
     @objc public func getThumbnail(
         id: String,
         returnBase64: Bool,
         size: Int,
         completion: @escaping ([String: Any]) -> Void
     ) {
-        let fetch = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil)
-        guard let asset = fetch.firstObject else {
-            completion(["webPath": "", "base64String": ""])
-            return
-        }
-
         let dim = size > 0 ? size : Self.defaultThumbSize
         let targetSize = CGSize(width: dim, height: dim)
 
-        let webPath = self.getOrCreateThumbnailFile(asset: asset, targetSize: targetSize) ?? ""
-        let b64 = (returnBase64 && !webPath.isEmpty)
-            ? self.readCachedAsBase64DataUrl(asset: asset, size: dim)
-            : ""
+        // Сначала пробуем как photo/video.
+        let photoFetch = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil)
+        if let asset = photoFetch.firstObject {
+            let webPath = self.getOrCreateThumbnailFile(asset: asset, targetSize: targetSize) ?? ""
+            let b64 = (returnBase64 && !webPath.isEmpty)
+                ? self.readCachedAsBase64DataUrl(localIdentifier: asset.localIdentifier, size: dim) : ""
+            completion(["webPath": webPath, "base64String": b64])
+            return
+        }
 
-        completion(["webPath": webPath, "base64String": b64])
+        // Если не нашли — пробуем как audio (id = persistentID в виде строки).
+        if let audioItem = audioItemByPersistentId(id) {
+            let webPath = self.getOrCreateAudioArtworkFile(item: audioItem, targetSize: targetSize) ?? ""
+            let b64 = (returnBase64 && !webPath.isEmpty)
+                ? self.readCachedAsBase64DataUrl(rawId: "audio_\(id)", size: dim) : ""
+            completion(["webPath": webPath, "base64String": b64])
+            return
+        }
+
+        completion(["webPath": "", "base64String": ""])
     }
 
-    /**
-     * Пакетная генерация миниатюр. Один нативный вызов = N миниатюр,
-     * что устраняет overhead на JS-мост.
-     */
     @objc public func getThumbnails(
         ids: [String],
         size: Int,
@@ -348,49 +354,53 @@ import UIKit
         let dim = size > 0 ? size : Self.defaultThumbSize
         let targetSize = CGSize(width: dim, height: dim)
 
-        let fetch = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
-        if fetch.count == 0 {
-            completion(["thumbnails": [String: String]()])
-            return
+        // Разделяем ID на photo/video и audio.
+        var phIds: [String] = []
+        var audioIds: [String] = []
+
+        let photoFetch = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+        var phAssetsById: [String: PHAsset] = [:]
+        photoFetch.enumerateObjects { asset, _, _ in
+            phAssetsById[asset.localIdentifier] = asset
+        }
+        for id in ids {
+            if phAssetsById[id] != nil { phIds.append(id) } else { audioIds.append(id) }
         }
 
-        // Собираем ассеты по id, чтобы порядок ответа совпадал с входным `ids`.
-        var assetsById: [String: PHAsset] = [:]
-        fetch.enumerateObjects { asset, _, _ in
-            assetsById[asset.localIdentifier] = asset
-        }
-
-        // Прогреваем кеш PHCachingImageManager — даёт быстрый decode на последующих requestImage.
-        let toCache: [PHAsset] = ids.compactMap { assetsById[$0] }
+        let toCache: [PHAsset] = phIds.compactMap { phAssetsById[$0] }
         if !toCache.isEmpty {
-            cachingImageManager.startCachingImages(
-                for: toCache,
-                targetSize: targetSize,
-                contentMode: .aspectFill,
-                options: nil
-            )
+            cachingImageManager.startCachingImages(for: toCache, targetSize: targetSize, contentMode: .aspectFill, options: nil)
         }
 
-        // Ограничиваем параллелизм, чтобы не перегружать I/O.
-        let workQueue = DispatchQueue(
-            label: "com.sangulov.plugins.mediastore.thumbnails",
-            attributes: .concurrent
-        )
+        let workQueue = DispatchQueue(label: "com.sangulov.plugins.mediastore.thumbnails", attributes: .concurrent)
         let semaphore = DispatchSemaphore(value: 6)
         let group = DispatchGroup()
         let lock = NSLock()
         var thumbs: [String: String] = [:]
 
-        for rawId in ids {
-            guard let asset = assetsById[rawId] else { continue }
+        for rawId in phIds {
+            guard let asset = phAssetsById[rawId] else { continue }
             group.enter()
             workQueue.async {
                 semaphore.wait()
                 let path = self.getOrCreateThumbnailFile(asset: asset, targetSize: targetSize)
                 if let p = path, !p.isEmpty {
-                    lock.lock()
-                    thumbs[rawId] = p
-                    lock.unlock()
+                    lock.lock(); thumbs[rawId] = p; lock.unlock()
+                }
+                semaphore.signal()
+                group.leave()
+            }
+        }
+
+        for rawId in audioIds {
+            group.enter()
+            workQueue.async {
+                semaphore.wait()
+                if let item = self.audioItemByPersistentId(rawId) {
+                    let path = self.getOrCreateAudioArtworkFile(item: item, targetSize: targetSize)
+                    if let p = path, !p.isEmpty {
+                        lock.lock(); thumbs[rawId] = p; lock.unlock()
+                    }
                 }
                 semaphore.signal()
                 group.leave()
@@ -400,10 +410,7 @@ import UIKit
         group.notify(queue: .global(qos: .userInitiated)) {
             if !toCache.isEmpty {
                 self.cachingImageManager.stopCachingImages(
-                    for: toCache,
-                    targetSize: targetSize,
-                    contentMode: .aspectFill,
-                    options: nil
+                    for: toCache, targetSize: targetSize, contentMode: .aspectFill, options: nil
                 )
             }
             completion(["thumbnails": thumbs])
@@ -411,7 +418,7 @@ import UIKit
     }
 
     // ────────────────────────────────────────────────────────────────────────
-    // Helpers Implementation
+    // Helpers
     // ────────────────────────────────────────────────────────────────────────
 
     private func assetToItem(asset: PHAsset) -> [String: Any] {
@@ -456,10 +463,89 @@ import UIKit
         ]
     }
 
+    private func audioItemToDictionary(_ item: MPMediaItem) -> [String: Any] {
+        let id = "\(item.persistentID)"
+        let title = item.title ?? ""
+        let artist = item.artist ?? ""
+        let album = item.albumTitle ?? ""
+        let duration = item.playbackDuration
+        let assetURL = item.assetURL
+
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let createdAt = formatter.string(from: item.dateAdded)
+
+        var uri = ""
+        var webPath: Any = NSNull()
+        var fileSize: Int64 = 0
+        var mimeType = "audio/mpeg"
+        var fileName = title.isEmpty ? "Untitled" : title
+
+        if let url = assetURL {
+            uri = url.absoluteString
+            webPath = "capacitor://localhost/_capacitor_file_" + url.path
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+               let s = attrs[.size] as? NSNumber {
+                fileSize = s.int64Value
+            }
+            fileName = url.lastPathComponent
+            mimeType = mimeTypeFromUTI(url.pathExtension)
+        }
+
+        return [
+            "id": id,
+            "type": "audio",
+            "uri": uri,
+            "webPath": webPath,
+            "thumbnailUri": NSNull(),
+            "thumbnailWebPath": NSNull(),
+            "width": 0,
+            "height": 0,
+            "createdAt": createdAt,
+            "duration": duration,
+            "mimeType": mimeType,
+            "fileSize": fileSize,
+            "fileName": fileName,
+            "title": title,
+            "artist": artist,
+            "album": album
+        ]
+    }
+
+    private func audioItemByPersistentId(_ id: String) -> MPMediaItem? {
+        guard let persistentID = UInt64(id) else { return nil }
+        let query = MPMediaQuery.songs()
+        query.addFilterPredicate(MPMediaPropertyPredicate(
+            value: NSNumber(value: persistentID),
+            forProperty: MPMediaItemPropertyPersistentID
+        ))
+        return query.items?.first
+    }
+
     /**
-     * Возвращает webPath к закешированному файлу миниатюры (или nil).
-     * Имена файлов sanitized по `[^A-Za-z0-9]` и включают `size`, чтобы хранить разные размеры параллельно.
+     * Сохраняет обложку аудио на диск; возвращает webPath или nil, если обложки нет.
      */
+    private func getOrCreateAudioArtworkFile(item: MPMediaItem, targetSize: CGSize) -> String? {
+        let safeId = "audio_\(item.persistentID)"
+        let dim = Int(targetSize.width)
+        let fileURL = thumbDir.appendingPathComponent("thumb_\(safeId)_\(dim).jpg")
+
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            return "capacitor://localhost/_capacitor_file_" + fileURL.path
+        }
+
+        guard let image = item.artwork?.image(at: targetSize),
+              let data = image.jpegData(compressionQuality: 0.7) else {
+            return nil
+        }
+        do {
+            try data.write(to: fileURL)
+            return "capacitor://localhost/_capacitor_file_" + fileURL.path
+        } catch {
+            return nil
+        }
+    }
+
     private func getOrCreateThumbnailFile(asset: PHAsset, targetSize: CGSize) -> String? {
         let safeId = asset.localIdentifier
             .replacingOccurrences(of: "[^A-Za-z0-9]", with: "_", options: .regularExpression)
@@ -481,61 +567,53 @@ import UIKit
         var deliveredFinal = false
 
         cachingImageManager.requestImage(
-            for: asset,
-            targetSize: targetSize,
-            contentMode: .aspectFill,
-            options: options
+            for: asset, targetSize: targetSize, contentMode: .aspectFill, options: options
         ) { image, info in
-            // .opportunistic может прислать несколько callback'ов: degraded → final.
-            // Берём ПОСЛЕДНИЙ (или единственный, если deliveryMode оказался mostly-fast).
             let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
             if deliveredFinal { return }
-            if isDegraded {
-                // skip и ждём финальный кадр
-                return
-            }
+            if isDegraded { return }
             deliveredFinal = true
             if let img = image, let data = img.jpegData(compressionQuality: 0.7) {
                 do {
                     try data.write(to: fileURL)
                     resultPath = "capacitor://localhost/_capacitor_file_" + fileURL.path
-                } catch {
-                    // запись не удалась — оставляем nil
-                }
+                } catch { }
             }
             semaphore.signal()
         }
-        // Ждём финального кадра до 5 секунд (защита от iCloud-задержек).
         _ = semaphore.wait(timeout: .now() + 5.0)
         return resultPath
     }
 
-    private func readCachedAsBase64DataUrl(asset: PHAsset, size: Int) -> String {
-        let safeId = asset.localIdentifier
+    private func readCachedAsBase64DataUrl(localIdentifier: String, size: Int) -> String {
+        let safeId = localIdentifier
             .replacingOccurrences(of: "[^A-Za-z0-9]", with: "_", options: .regularExpression)
-        let fileURL = thumbDir.appendingPathComponent("thumb_\(safeId)_\(size).jpg")
+        return readCachedAsBase64DataUrl(rawId: safeId, size: size)
+    }
+
+    private func readCachedAsBase64DataUrl(rawId: String, size: Int) -> String {
+        let fileURL = thumbDir.appendingPathComponent("thumb_\(rawId)_\(size).jpg")
         guard let data = try? Data(contentsOf: fileURL) else { return "" }
         return "data:image/jpeg;base64,\(data.base64EncodedString())"
     }
 
     private func resolveWebPath(for asset: PHAsset, completion: @escaping (String?) -> Void) {
         let options = PHContentEditingInputRequestOptions()
-        options.isNetworkAccessAllowed = true // разрешаем скачивание из iCloud
+        options.isNetworkAccessAllowed = true
 
         asset.requestContentEditingInput(with: options) { input, _ in
             guard let url = input?.fullSizeImageURL else {
-                // Для видео fallback
                 if asset.mediaType == .video {
-                   let videoOptions = PHVideoRequestOptions()
-                   videoOptions.isNetworkAccessAllowed = true
-                   PHImageManager.default().requestAVAsset(forVideo: asset, options: videoOptions) { avAsset, _, _ in
-                       if let urlAsset = avAsset as? AVURLAsset {
-                           completion(self.convertToCapacitorPath(url: urlAsset.url))
-                       } else {
-                           completion(nil)
-                       }
-                   }
-                   return
+                    let videoOptions = PHVideoRequestOptions()
+                    videoOptions.isNetworkAccessAllowed = true
+                    PHImageManager.default().requestAVAsset(forVideo: asset, options: videoOptions) { avAsset, _, _ in
+                        if let urlAsset = avAsset as? AVURLAsset {
+                            completion(self.convertToCapacitorPath(url: urlAsset.url))
+                        } else {
+                            completion(nil)
+                        }
+                    }
+                    return
                 }
                 completion(nil)
                 return
@@ -545,17 +623,13 @@ import UIKit
     }
 
     private func convertToCapacitorPath(url: URL) -> String {
-        // На iOS Capacitor использует bridge для конвертации file:// URL.
-        // Стандартный формат: capacitor://localhost/_capacitor_file_ + path
         return "capacitor://localhost/_capacitor_file_" + url.path
     }
 
-    // MARK: - Helpers
-
     /**
-     * Конвертирует UTI (Uniform Type Identifier) в MIME-тип.
+     * Конвертирует UTI (Uniform Type Identifier) либо расширение файла в MIME-тип.
      */
-    private func mimeTypeFromUTI(_ uti: String) -> String {
+    private func mimeTypeFromUTI(_ utiOrExt: String) -> String {
         let map: [String: String] = [
             "public.jpeg": "image/jpeg",
             "public.png": "image/png",
@@ -567,8 +641,18 @@ import UIKit
             "public.mpeg-4": "video/mp4",
             "com.apple.quicktime-movie": "video/quicktime",
             "public.avi": "video/avi",
-            "public.3gpp": "video/3gpp"
+            "public.3gpp": "video/3gpp",
+            "public.mp3": "audio/mpeg",
+            "com.apple.m4a-audio": "audio/mp4",
+            "public.aac-audio": "audio/aac"
         ]
-        return map[uti] ?? "application/octet-stream"
+        if let m = map[utiOrExt] { return m }
+        if #available(iOS 14.0, *) {
+            if let t = UniformTypeIdentifiers.UTType(filenameExtension: utiOrExt),
+               let m = t.preferredMIMEType {
+                return m
+            }
+        }
+        return "application/octet-stream"
     }
 }
