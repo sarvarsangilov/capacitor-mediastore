@@ -58,7 +58,8 @@ class FilePicker(private val context: Context) {
     // ────────────────────────────────────────────────────────────────────────
 
     /**
-     * Строит Intent для системного пикера. `mimeTypes` пуст → "*/*".
+     * Строит Intent для системного пикера. Если `mimeTypes` пуст — разрешает
+     * любые типы (эквивалент применения шаблона `＊/＊`).
      */
     fun buildPickIntent(mimeTypes: List<String>, multiple: Boolean): Intent {
         return Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
@@ -320,7 +321,7 @@ class FilePicker(private val context: Context) {
         }
     }
 
-    /** Поддерживает точные значения (`application/pdf`) и wildcards (`image/*`). */
+    // Поддерживает точные значения (например application/pdf) и wildcards вида image со слэш-звёздочкой.
     private fun matchesMime(mime: String, pattern: String): Boolean {
         if (pattern == "*/*") return true
         if (pattern.endsWith("/*")) {

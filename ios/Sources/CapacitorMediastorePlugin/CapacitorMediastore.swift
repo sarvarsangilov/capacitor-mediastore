@@ -407,8 +407,18 @@ import UniformTypeIdentifiers
         cursor: String?,
         completion: @escaping ([String: Any]) -> Void
     ) {
+        // Проверка авторизации — без неё MPMediaQuery.items вернёт nil.
+        let auth = MPMediaLibrary.authorizationStatus()
+        NSLog("[CapacitorMediastore] getAudio: auth=\(auth.rawValue), limit=\(limit), offset=\(offset), cursor=\(cursor != nil)")
+        if auth != .authorized {
+            NSLog("[CapacitorMediastore] getAudio: NOT authorized — call requestPermissions() first")
+            completion(["media": [], "total": 0, "hasMore": false, "nextCursor": NSNull()]); return
+        }
+
         let query = MPMediaQuery.songs()
-        guard var items = query.items, !items.isEmpty else {
+        let allItems = query.items
+        NSLog("[CapacitorMediastore] getAudio: MPMediaQuery.songs() returned \(allItems?.count ?? -1) items")
+        guard var items = allItems, !items.isEmpty else {
             completion(["media": [], "total": 0, "hasMore": false, "nextCursor": NSNull()]); return
         }
 

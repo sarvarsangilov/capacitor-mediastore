@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 import android.util.Base64
+import android.util.Log
 import android.util.Size
 import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
@@ -70,6 +71,7 @@ class MediaGallery(private val context: Context) {
     private val thumbnailSemaphore = Semaphore(6)
 
     companion object {
+        private const val TAG = "CapacitorMediastore"
         private const val DEFAULT_THUMB_SIZE = 256
         private const val THUMB_QUALITY = 75
 
@@ -152,6 +154,7 @@ class MediaGallery(private val context: Context) {
         type: String,
         cursor: String?
     ): JSObject = withContext(Dispatchers.IO) {
+        Log.d(TAG, "getMedia: type=$type, albumId=$albumId, limit=$limit, offset=$offset, cursor=${cursor != null}")
         val collections = when (type) {
             "photo" -> listOf(CollectionInfo(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "photo"))
             "video" -> listOf(CollectionInfo(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, "video"))
@@ -165,7 +168,9 @@ class MediaGallery(private val context: Context) {
         var total = 0
         for (col in collections) {
             val filterAlbum = if (col.type == "audio") null else albumId
-            total += countMedia(col.uri, filterAlbum)
+            val c = countMedia(col.uri, filterAlbum)
+            Log.d(TAG, "getMedia: countMedia(${col.type}) = $c")
+            total += c
         }
 
         val cursorPos: CursorPosition? = if (cursor.isNullOrEmpty()) null else decodeCursor(cursor)
@@ -458,25 +463,33 @@ class MediaGallery(private val context: Context) {
 
         // Sort + limit. На API 26+ можно использовать Bundle-аргументы.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // На Android 11+ (R+) `QUERY_ARG_SQL_SORT_ORDER` для MediaStore
+            // может молча игнорироваться — используем структурированную форму
+            // с multi-column sort через `QUERY_ARG_SORT_COLUMNS`.
             val args = Bundle().apply {
                 if (selection != null) {
                     putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selection)
                     putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, selectionArgs)
                 }
-                // Multi-column sort через QUERY_ARG_SQL_SORT_ORDER (legacy форма).
-                putString(
-                    ContentResolver.QUERY_ARG_SQL_SORT_ORDER,
-                    "${MediaStore.MediaColumns.DATE_ADDED} DESC, ${MediaStore.MediaColumns._ID} DESC"
+                putStringArray(
+                    ContentResolver.QUERY_ARG_SORT_COLUMNS,
+                    arrayOf(MediaStore.MediaColumns.DATE_ADDED, MediaStore.MediaColumns._ID)
+                )
+                putInt(
+                    ContentResolver.QUERY_ARG_SORT_DIRECTION,
+                    ContentResolver.QUERY_SORT_DIRECTION_DESCENDING
                 )
                 putInt(ContentResolver.QUERY_ARG_LIMIT, take)
                 putInt(ContentResolver.QUERY_ARG_OFFSET, 0)
             }
             contentResolver.query(collection, projection, args, null)?.use { c ->
+                Log.d(TAG, "queryMediaPage[$mediaType]: cursor=${c.count} rows, take=$take")
                 while (c.moveToNext()) out.add(cursorToMediaItem(c, collection, mediaType))
             }
         } else {
             val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC, ${MediaStore.MediaColumns._ID} DESC LIMIT $take"
             contentResolver.query(collection, projection, selection, selectionArgs, sortOrder)?.use { c ->
+                Log.d(TAG, "queryMediaPage[$mediaType] (legacy): cursor=${c.count} rows, take=$take")
                 while (c.moveToNext()) out.add(cursorToMediaItem(c, collection, mediaType))
             }
         }
