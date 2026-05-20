@@ -54,7 +54,7 @@ npx cap sync
 
 ## Использование
 
-### Медиагалерея (фото / видео / аудио)
+### Базовый поток
 
 ```typescript
 import { CapacitorMediastore } from 'capacitor-mediastore';
@@ -63,39 +63,123 @@ import { CapacitorMediastore } from 'capacitor-mediastore';
 const perm = await CapacitorMediastore.requestPermissions();
 // → { photos: 'granted', videos: 'granted', audio: 'granted' }
 
-// 2. Список альбомов фото/видео
-const { albums } = await CapacitorMediastore.getAlbums();
+// 2. Быстрая проверка перед показом вкладок (~миллисекунда, не грузит метаданные)
+const audioAvailable = (await CapacitorMediastore.hasMedia({ type: 'audio' })).available;
 
-// 3. Страница медиа (без миниатюр — для скорости)
-const { media, hasMore } = await CapacitorMediastore.getMedia({
+// 3. Страница медиа БЕЗ миниатюр (для скорости)
+const { media, nextCursor } = await CapacitorMediastore.getMedia({
   type: 'photo', // 'photo' | 'video' | 'audio' | 'all'
   limit: 50,
   offset: 0,
 });
 
-// 4. Lazy-thumbnail для одного айтема
-const { webPath } = await CapacitorMediastore.getThumbnail({ id: media[0].id });
-
-// 5. Пакетная генерация миниатюр для виртуализированного списка
+// 4. Пакетная генерация миниатюр для виртуализированного списка
 const { thumbnails } = await CapacitorMediastore.getThumbnails({
   ids: media.slice(0, 20).map((m) => m.id),
   size: 256,
+  density: window.devicePixelRatio, // ⭐ для чёткости на Retina/3x
+});
+
+// 5. Прогрев кеша вперёд по скроллу (НЕ ждём результата)
+CapacitorMediastore.prefetchThumbnails({
+  ids: media.slice(20, 60).map((m) => m.id),
+  size: 256,
+  density: window.devicePixelRatio,
+});
+
+// 6. Когда пользователь открыл конкретное фото — резолвим тяжёлый webPath
+const { webPath } = await CapacitorMediastore.resolveMediaPath({ id: media[0].id });
+// На iOS это вызывает экспорт через requestContentEditingInput,
+// на Android просто возвращает уже готовый content://-путь.
+```
+
+### Cursor-based пагинация (для гигантских галерей)
+
+Для галерей **50k+ файлов** offset-пагинация деградирует — `OFFSET 10000 LIMIT 50` заставляет БД пропустить 10000 строк. Cursor-режим даёт **O(log n)**:
+
+```typescript
+let cursor: string | null = null;
+const allItems: MediaItem[] = [];
+
+while (true) {
+  const page = await CapacitorMediastore.getMedia({
+    type: 'photo',
+    limit: 50,
+    offset: 0, // игнорируется при наличии cursor
+    cursor: cursor ?? undefined,
+  });
+  allItems.push(...page.media);
+  if (!page.hasMore) break;
+  cursor = page.nextCursor;
+}
+```
+
+Cursor — это base64-токен, опаковый для клиента. Не парсите его, просто передавайте обратно.
+
+### Density для Retina / 3x-экранов
+
+UI-плитка 100dp на iPhone 14 Pro Max — это **300 физических пикселей**. Миниатюра 256×256 при отображении в такой плитке апскейлится и **визуально замыливается**. Передавайте `density: window.devicePixelRatio`:
+
+```typescript
+const dpr = window.devicePixelRatio; // 2 или 3 на современных девайсах
+const { webPath } = await CapacitorMediastore.getThumbnail({
+  id,
+  size: 100,      // желаемый размер плитки в DP/CSS-пикселях
+  density: dpr,   // → реальный файл будет 200×200 или 300×300
 });
 ```
 
-Для `type: 'audio'` элементы `MediaItem` дополнительно содержат `title`, `artist`, `album`.
-Миниатюра для аудио — это обложка альбома, если она есть в системной библиотеке.
+Кеш именован `thumb_<id>_<size*density>.webp` (Android) / `.jpg` (iOS), так что один файл — одна плотность; разные плотности кешируются параллельно.
 
-`type: 'all'` возвращает **только** фото + видео (без аудио) — как «общая лента» галереи.
-Для аудио используйте отдельный вызов с `type: 'audio'`.
+### Отмена pending-задач при быстром скролле
+
+При быстром скролле списка нет смысла декодировать миниатюры для уже-проскроленных элементов:
+
+```typescript
+// При смене страницы / большом scroll velocity
+await CapacitorMediastore.cancelPendingThumbnails();
+// затем запрашиваем новый набор
+await CapacitorMediastore.getThumbnails({ ids: nowVisibleIds, ... });
+```
+
+Уже сохранённые на диске миниатюры остаются в кеше — отменяются только in-flight запросы. На iOS отменяется через `PHImageManager.cancelImageRequest`, на Android — через `Job.cancel()`.
+
+### Авто-обновление при изменениях галереи
+
+```typescript
+const handle = await CapacitorMediastore.addListener(
+  'mediaLibraryChanged',
+  ({ types }) => {
+    if (types.includes('photo')) refreshPhotosTab();
+    if (types.includes('audio')) refreshMusicTab();
+  }
+);
+
+// при unmount
+await handle.remove();
+```
+
+События дебаунсятся 500ms, чтобы batch-операции (удаление 50 фото скриптом) генерили одно событие. Подписка на Android — `ContentObserver` на `MediaStore.Images/Video/Audio`. На iOS — `PHPhotoLibraryChangeObserver` + `MPMediaLibraryDidChange` Notification.
+
+### Live Photo / HDR / ориентация
+
+`MediaItem` теперь включает:
+
+```typescript
+{
+  // ...
+  orientation: 0 | 90 | 180 | 270,  // для видео — из EXIF; для фото обычно 0
+  isLivePhoto: boolean,              // iOS only
+  isHDR: boolean,                    // iOS only
+}
+```
+
+UI может показать badge «LIVE» на Live Photos и заранее повернуть видео-плеер под нужную ориентацию (без «прыжка» при загрузке метаданных).
 
 ### Файлпикер и «недавние»
 
 ```typescript
 // 1. Открыть системный пикер. Пользователь выбирает PDF / DOC / ZIP и т.д.
-//    После выбора плагин САМ берёт persistable-permission (Android) /
-//    создаёт security-scoped bookmark (iOS) и сохраняет запись в локальном
-//    хранилище плагина.
 const { files } = await CapacitorMediastore.pickFiles({
   mimeTypes: ['application/pdf', 'image/*'],
   multiple: true,
@@ -105,26 +189,33 @@ const { files } = await CapacitorMediastore.pickFiles({
 const recent = await CapacitorMediastore.getRecentFiles({
   limit: 50,
   offset: 0,
-  // mimeTypes: ['application/pdf'], // опционально
 });
-// → { files: PickedFile[], total, hasMore }
-// Файлы отсортированы по lastAccessedAt DESC.
-// Записи, к которым доступ утерян, молча выкидываются из хранилища.
 
-// 3. Перед открытием файла — резолвим (обновляем lastAccessedAt + актуальный webPath)
+// 3. Перед открытием файла — резолвим (актуальный webPath + bump lastAccessedAt)
 const { file } = await CapacitorMediastore.resolveRecentFile({ id: recent.files[0].id });
 if (file) {
-  // <iframe src={file.webPath}> — откроет PDF и т.п.
-  // Android webPath: "https://localhost/_capacitor_content_/..."
-  // iOS    webPath: "capacitor://localhost/_capacitor_file_/..."
+  // <iframe src={file.webPath}>
 }
 
-// 4. Убрать запись из «недавних» (файл на диске не удаляется)
-await CapacitorMediastore.removeRecentFile({ id: recent.files[0].id });
+// 4. Streaming-чтение больших файлов (PDF 500MB, видео и т.д.)
+let offset = 0;
+const chunkSize = 1_048_576; // 1 MB
+while (true) {
+  const chunk = await CapacitorMediastore.readFileChunk({
+    id: file!.id, offset, length: chunkSize,
+  });
+  // chunk.data — base64. Decode и пишем в IndexedDB / шлём в сеть с прогрессом.
+  offset += chunk.bytesRead;
+  updateProgress(offset / chunk.totalSize);
+  if (chunk.eof) break;
+}
 
-// 5. Очистить весь список
+// 5. Управление
+await CapacitorMediastore.removeRecentFile({ id });
 await CapacitorMediastore.clearRecentFiles();
 ```
+
+`readFileChunk` решает проблему «как загрузить 1 ГБ видео не повесив webview» — `fetch(webPath)` грузит весь файл в память сразу, что плохо. Streaming читает по чанкам прямо с диска под security-scoped access.
 
 ### Шаблон «как в Telegram»
 
@@ -132,7 +223,7 @@ UI-вкладки мессенджера обычно строятся так:
 
 | Вкладка | Метод | Источник |
 |---|---|---|
-| 📷 Галерея | `getMedia({ type: 'all' })` + `getThumbnails` | MediaStore Images/Video (Android), PhotoKit (iOS) |
+| 📷 Галерея | `getMedia({ type: 'all' })` + `getThumbnails` + `prefetchThumbnails` | MediaStore Images/Video (Android), PhotoKit (iOS) |
 | 🎵 Музыка | `getMedia({ type: 'audio' })` | MediaStore.Audio (Android), MPMediaLibrary (iOS) |
 | 📄 Файлы | `getRecentFiles()` + кнопка «+» → `pickFiles()` | Plugin-storage с persistable URI / bookmark |
 
@@ -164,17 +255,28 @@ bookmark резолвится через `URL(resolvingBookmarkData:)` с про
 
 ## Производительность
 
-* `getMedia` намеренно **не** возвращает миниатюры — это в десятки раз быстрее на больших галереях.
-  Используйте `getThumbnails({ ids })` пакетно при появлении айтемов в видимой области.
-* Миниатюры кэшируются на диске (`cacheDir/mediastore_thumbs/`). Повторный запрос
-  той же `id × size` отдаёт уже готовый файл без перегенерации.
-* На Android `getMedia({ type: 'all' })` использует merge-sort двух уже отсортированных
-  курсоров (`Images` и `Video`) без `UNION` — стабильно ~10–50 мс на 50 элементов.
-* На iOS `getThumbnails` прогревает `PHCachingImageManager` и ограничивает параллелизм
-  декодирования через семафор (6 потоков).
-* «Недавние» файлы храним в простом JSON (SharedPreferences на Android, файл в
-  Application Support на iOS) — без Room/CoreData, без миграций, операции `O(n)` от
-  размера списка (типично десятки записей).
+Цель — приближение к UX нативных галерей iOS Photos / Google Photos. Что для этого сделано:
+
+* **WebP-миниатюры на Android** (на 25–30% меньше JPEG, быстрее декодирование).
+* **Семафор-throttling**: на обеих платформах ≤6 одновременных декодов миниатюр.
+  Не перегружает IO-пул и не вызывает jank при скролле.
+* **Async callbacks на iOS** вместо `DispatchSemaphore.wait()` — нет блокировки
+  потоков GCD, нет starvation при медленных iCloud-сетях.
+* **Lazy webPath**: в `getMedia` на iOS не делаем дорогой экспорт через
+  `requestContentEditingInput` для каждого элемента — это происходит лениво в
+  `resolveMediaPath` только когда юзер открыл конкретный файл.
+* **`PHCachingImageManager` warmup** перед `getThumbnails`, плюс отдельный
+  `prefetchThumbnails` для прогрева вне списка.
+* **Cancellation**: отмена через `PHImageManager.cancelImageRequest` /
+  `kotlinx.coroutines.Job.cancel()`. При быстром скролле не тратим CPU на
+  невидимые элементы.
+* **Cursor-pagination**: `O(log n)` против `O(offset)` для гигантских галерей.
+* **Density-aware thumbnails**: миниатюры сохраняются в физических пикселях, без
+  размытия при апскейле на Retina/3x.
+* **Дисковый кеш** в `cacheDir/mediastore_thumbs/`. Повторный запрос
+  `id × size × density` отдаётся мгновенно. Система сама чистит при нехватке места.
+* **«Недавние» — простой JSON** (SharedPreferences на Android, файл в Application
+  Support на iOS). Без Room/CoreData, без миграций.
 
 ### Подсказки для `<img>`
 
@@ -182,8 +284,8 @@ bookmark резолвится через `URL(resolvingBookmarkData:)` с про
 <img src="${webPath}" loading="lazy" decoding="async" />
 ```
 
-* По умолчанию миниатюра — 256×256. Если в UI плитки <128 px — передавайте `size: 128`,
-  это экономит память.
+* По умолчанию миниатюра — 256×256 (DP). Передавайте `density: window.devicePixelRatio`
+  для чёткости на Retina.
 * `webPath` (file URL) в 5–10× быстрее, чем `data:image/...` base64. Используйте base64
   только когда нужно сохранить миниатюру в IndexedDB или отправить по сети.
 
@@ -195,13 +297,20 @@ bookmark резолвится через `URL(resolvingBookmarkData:)` с про
 * [`requestPermissions()`](#requestpermissions)
 * [`getAlbums()`](#getalbums)
 * [`getMedia(...)`](#getmedia)
+* [`hasMedia(...)`](#hasmedia)
+* [`resolveMediaPath(...)`](#resolvemediapath)
 * [`getThumbnail(...)`](#getthumbnail)
 * [`getThumbnails(...)`](#getthumbnails)
+* [`prefetchThumbnails(...)`](#prefetchthumbnails)
+* [`cancelPendingThumbnails()`](#cancelpendingthumbnails)
 * [`pickFiles(...)`](#pickfiles)
 * [`getRecentFiles(...)`](#getrecentfiles)
 * [`resolveRecentFile(...)`](#resolverecentfile)
+* [`readFileChunk(...)`](#readfilechunk)
 * [`removeRecentFile(...)`](#removerecentfile)
 * [`clearRecentFiles()`](#clearrecentfiles)
+* [`addListener('mediaLibraryChanged', ...)`](#addlistenermedialibrarychanged-)
+* [`removeAllListeners()`](#removealllisteners)
 * [Interfaces](#interfaces)
 * [Type Aliases](#type-aliases)
 
@@ -260,11 +369,57 @@ getMedia(options: GetMediaOptions) => Promise<GetMediaResult>
 Возвращает список медиафайлов с метаданными (БЕЗ миниатюр).
 При `type: 'audio'` возвращает треки из системной музыкальной библиотеки.
 
+Поддерживает два режима пагинации:
+ - **offset** (поля `limit` / `offset`) — удобно для прыжков в произвольное место.
+ - **cursor** (поле `cursor`, приоритет над offset) — O(log n) для гигантских галерей.
+
 | Param         | Type                                                        |
 | ------------- | ----------------------------------------------------------- |
 | **`options`** | <code><a href="#getmediaoptions">GetMediaOptions</a></code> |
 
 **Returns:** <code>Promise&lt;<a href="#getmediaresult">GetMediaResult</a>&gt;</code>
+
+--------------------
+
+
+### hasMedia(...)
+
+```typescript
+hasMedia(options: HasMediaOptions) => Promise<HasMediaResult>
+```
+
+Дешёвая проверка: есть ли в коллекции хоть один файл?
+Используйте на старте приложения, чтобы решить, показывать ли вкладку.
+Не загружает метаданные.
+
+| Param         | Type                                                        |
+| ------------- | ----------------------------------------------------------- |
+| **`options`** | <code><a href="#hasmediaoptions">HasMediaOptions</a></code> |
+
+**Returns:** <code>Promise&lt;<a href="#hasmediaresult">HasMediaResult</a>&gt;</code>
+
+--------------------
+
+
+### resolveMediaPath(...)
+
+```typescript
+resolveMediaPath(options: ResolveMediaPathOptions) => Promise<ResolveMediaPathResult>
+```
+
+Лениво резолвит `webPath` для <a href="#mediaitem">`MediaItem`</a> на iOS (на Android всегда
+заполнен в `getMedia`, метод возвращает уже готовое значение).
+
+Под капотом на iOS делает `requestContentEditingInput` /
+`requestAVAsset` — это **дорогая** операция (экспорт файла во временную
+папку), поэтому вызывайте только в момент, когда пользователь реально
+открывает фото / видео.
+
+| Param         | Type                                                                        |
+| ------------- | --------------------------------------------------------------------------- |
+| **`options`** | <code><a href="#resolvemediapathoptions">ResolveMediaPathOptions</a></code> |
+
+**Returns:** <code>Promise&lt;<a href="#resolvemediapathresult">ResolveMediaPathResult</a>&gt;</code>
 
 --------------------
 
@@ -296,11 +451,51 @@ getThumbnails(options: GetThumbnailsOptions) => Promise<GetThumbnailsResult>
 Пакетная генерация миниатюр (lazy load для виртуализированных списков).
 Один нативный вызов = N миниатюр, чтобы устранить overhead JS-моста.
 
+На обеих платформах ограничивает параллелизм (~6 одновременных декодов)
+и использует кеш `getOrCreateThumbnail*` — повторные запросы того же
+`id × size × density` отдаются мгновенно.
+
 | Param         | Type                                                                  |
 | ------------- | --------------------------------------------------------------------- |
 | **`options`** | <code><a href="#getthumbnailsoptions">GetThumbnailsOptions</a></code> |
 
 **Returns:** <code>Promise&lt;<a href="#getthumbnailsresult">GetThumbnailsResult</a>&gt;</code>
+
+--------------------
+
+
+### prefetchThumbnails(...)
+
+```typescript
+prefetchThumbnails(options: GetThumbnailsOptions) => Promise<void>
+```
+
+Прогревает кеш миниатюр в фоне. Возвращается **сразу** (промис резолвится
+после старта background-задач, не ждёт их завершения).
+
+Используйте в виртуализированном списке: при появлении в viewport
+элементов 100-109 — стрельните prefetch для 110-130, чтобы к моменту
+скролла туда миниатюры уже были на диске.
+
+| Param         | Type                                                                  |
+| ------------- | --------------------------------------------------------------------- |
+| **`options`** | <code><a href="#getthumbnailsoptions">GetThumbnailsOptions</a></code> |
+
+--------------------
+
+
+### cancelPendingThumbnails()
+
+```typescript
+cancelPendingThumbnails() => Promise<void>
+```
+
+Отменяет все pending-задачи на генерацию миниатюр, запущенные через
+`getThumbnails` / `prefetchThumbnails`. Уже завершённые миниатюры
+остаются в кеше.
+
+Полезно при быстром скролле: на смене страницы отменяете старые
+запросы и запускаете новые, экономя CPU/батарею.
 
 --------------------
 
@@ -373,6 +568,39 @@ resolveRecentFile(options: ResolveRecentFileOptions) => Promise<ResolveRecentFil
 --------------------
 
 
+### readFileChunk(...)
+
+```typescript
+readFileChunk(options: ReadFileChunkOptions) => Promise<ReadFileChunkResult>
+```
+
+Читает фрагмент файла из «недавних» (для streaming-загрузки больших файлов
+без полной материализации в памяти).
+
+Типичный паттерн — загрузить PDF / video по чанкам с прогрессом:
+
+```ts
+let offset = 0;
+while (true) {
+  const chunk = await CapacitorMediastore.readFileChunk({ id, offset, length: 1_000_000 });
+  // chunk.data — base64, decode и шлём в сеть/IndexedDB
+  offset += chunk.bytesRead;
+  if (chunk.eof) break;
+}
+```
+
+Без этого метода единственный способ прочитать большой файл — `fetch(webPath)`,
+который загружает весь файл в память сразу (плохо для 500 МБ видео).
+
+| Param         | Type                                                                  |
+| ------------- | --------------------------------------------------------------------- |
+| **`options`** | <code><a href="#readfilechunkoptions">ReadFileChunkOptions</a></code> |
+
+**Returns:** <code>Promise&lt;<a href="#readfilechunkresult">ReadFileChunkResult</a>&gt;</code>
+
+--------------------
+
+
 ### removeRecentFile(...)
 
 ```typescript
@@ -397,6 +625,47 @@ clearRecentFiles() => Promise<void>
 
 Очищает все «недавние» файлы. Отзывает все persistable permissions
 (Android) / удаляет все bookmarks (iOS). Сами файлы на диске НЕ удаляются.
+
+--------------------
+
+
+### addListener('mediaLibraryChanged', ...)
+
+```typescript
+addListener(eventName: 'mediaLibraryChanged', listenerFunc: (event: MediaLibraryChangeEvent) => void) => Promise<PluginListenerHandle>
+```
+
+Подписка на изменения системной галереи (новые фото, удалённые видео и т.д.).
+Событие приходит с дебаунсом 500ms, чтобы не спамить при batch-операциях.
+
+```ts
+const handle = await CapacitorMediastore.addListener(
+  'mediaLibraryChanged',
+  ({ types }) =&gt; {
+    if (types.includes('photo')) refreshPhotosTab();
+  }
+);
+// при размонтировании
+handle.remove();
+```
+
+| Param              | Type                                                                                            |
+| ------------------ | ----------------------------------------------------------------------------------------------- |
+| **`eventName`**    | <code>'mediaLibraryChanged'</code>                                                              |
+| **`listenerFunc`** | <code>(event: <a href="#medialibrarychangeevent">MediaLibraryChangeEvent</a>) =&gt; void</code> |
+
+**Returns:** <code>Promise&lt;<a href="#pluginlistenerhandle">PluginListenerHandle</a>&gt;</code>
+
+--------------------
+
+
+### removeAllListeners()
+
+```typescript
+removeAllListeners() => Promise<void>
+```
+
+Удаляет всех слушателей плагина.
 
 --------------------
 
@@ -434,60 +703,95 @@ clearRecentFiles() => Promise<void>
 
 #### GetMediaResult
 
-| Prop          | Type                     | Description                                                      |
-| ------------- | ------------------------ | ---------------------------------------------------------------- |
-| **`media`**   | <code>MediaItem[]</code> |                                                                  |
-| **`total`**   | <code>number</code>      | Общее количество медиа, соответствующих фильтру (для пагинации). |
-| **`hasMore`** | <code>boolean</code>     | Есть ли ещё элементы после текущей страницы.                     |
+| Prop             | Type                        | Description                                                                                                |
+| ---------------- | --------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| **`media`**      | <code>MediaItem[]</code>    |                                                                                                            |
+| **`total`**      | <code>number</code>         | Общее количество медиа, соответствующих фильтру (для пагинации).                                           |
+| **`hasMore`**    | <code>boolean</code>        | Есть ли ещё элементы после текущей страницы.                                                               |
+| **`nextCursor`** | <code>string \| null</code> | Курсор для следующей страницы. `null`, если страница последняя. Передавайте в `cursor` следующего запроса. |
 
 
 #### MediaItem
 
-| Prop                   | Type                                       | Description                                                                                                                                                                                                                                  |
-| ---------------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`id`**               | <code>string</code>                        | Уникальный идентификатор медиафайла.                                                                                                                                                                                                         |
-| **`type`**             | <code>'photo' \| 'video' \| 'audio'</code> | Тип: `photo`, `video` или `audio`.                                                                                                                                                                                                           |
-| **`uri`**              | <code>string</code>                        | URI / путь к полноразмерному файлу (нативный идентификатор).                                                                                                                                                                                 |
-| **`webPath`**          | <code>string \| null</code>                | URL, пригодный для `&lt;img src&gt;` / `&lt;video src&gt;` / `&lt;audio src&gt;` внутри WebView. На Android: `https://localhost/_capacitor_content_/...` На iOS: `capacitor://localhost/_capacitor_file_/tmp/...` На Web: совпадает с `uri`. |
-| **`thumbnailUri`**     | <code>string \| null</code>                | URI миниатюры. В `getMedia` всегда `null` — миниатюра грузится через `getThumbnail`.                                                                                                                                                         |
-| **`thumbnailWebPath`** | <code>string \| null</code>                | URL миниатюры. В `getMedia` всегда `null` — миниатюра грузится через `getThumbnail`.                                                                                                                                                         |
-| **`width`**            | <code>number</code>                        | Ширина в пикселях (для аудио — 0).                                                                                                                                                                                                           |
-| **`height`**           | <code>number</code>                        | Высота в пикселях (для аудио — 0).                                                                                                                                                                                                           |
-| **`createdAt`**        | <code>string</code>                        | Дата создания (ISO 8601 строка).                                                                                                                                                                                                             |
-| **`duration`**         | <code>number</code>                        | Длительность в секундах (для аудио и видео; 0 для фото).                                                                                                                                                                                     |
-| **`mimeType`**         | <code>string</code>                        | MIME-тип файла.                                                                                                                                                                                                                              |
-| **`fileSize`**         | <code>number</code>                        | Размер файла в байтах.                                                                                                                                                                                                                       |
-| **`fileName`**         | <code>string</code>                        | Имя файла.                                                                                                                                                                                                                                   |
-| **`title`**            | <code>string</code>                        | Название трека (заполняется только для `audio`).                                                                                                                                                                                             |
-| **`artist`**           | <code>string</code>                        | Исполнитель (заполняется только для `audio`).                                                                                                                                                                                                |
-| **`album`**            | <code>string</code>                        | Альбом трека (заполняется только для `audio`).                                                                                                                                                                                               |
+| Prop                   | Type                                       | Description                                                                                                                                                                                                                                                                                                                                |
+| ---------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **`id`**               | <code>string</code>                        | Уникальный идентификатор медиафайла.                                                                                                                                                                                                                                                                                                       |
+| **`type`**             | <code>'photo' \| 'video' \| 'audio'</code> | Тип: `photo`, `video` или `audio`.                                                                                                                                                                                                                                                                                                         |
+| **`uri`**              | <code>string</code>                        | Нативный URI / путь к полноразмерному файлу.                                                                                                                                                                                                                                                                                               |
+| **`webPath`**          | <code>string \| null</code>                | URL для `&lt;img/video/audio src&gt;` внутри WebView. На Android всегда заполнен (это бесплатное преобразование `content://`). На iOS в `getMedia` возвращается `null` для скорости — реальный экспорт фото/видео из `Photos framework` делает [resolveMediaPath] лениво, по требованию (когда пользователь действительно открывает файл). |
+| **`thumbnailUri`**     | <code>string \| null</code>                | URI миниатюры. В `getMedia` всегда `null` — миниатюра грузится через `getThumbnail`.                                                                                                                                                                                                                                                       |
+| **`thumbnailWebPath`** | <code>string \| null</code>                | URL миниатюры. В `getMedia` всегда `null` — миниатюра грузится через `getThumbnail`.                                                                                                                                                                                                                                                       |
+| **`width`**            | <code>number</code>                        | Ширина в пикселях с учётом ориентации. Для аудио — 0.                                                                                                                                                                                                                                                                                      |
+| **`height`**           | <code>number</code>                        | Высота в пикселях с учётом ориентации. Для аудио — 0.                                                                                                                                                                                                                                                                                      |
+| **`orientation`**      | <code>number</code>                        | Поворот файла в градусах (0, 90, 180, 270). Для видео берётся из EXIF; для фото обычно 0 (Photos / MediaStore сами нормализуют ориентацию при выдаче битмапа).                                                                                                                                                                             |
+| **`isLivePhoto`**      | <code>boolean</code>                       | Live Photo (только iOS). На Android всегда `false`. UI может показать badge «LIVE» и проигрывать анимацию по long-press.                                                                                                                                                                                                                   |
+| **`isHDR`**            | <code>boolean</code>                       | HDR-фото или Dolby Vision видео (только iOS). На Android всегда `false`.                                                                                                                                                                                                                                                                   |
+| **`createdAt`**        | <code>string</code>                        | Дата создания (ISO 8601 строка).                                                                                                                                                                                                                                                                                                           |
+| **`duration`**         | <code>number</code>                        | Длительность в секундах (для аудио и видео; 0 для фото).                                                                                                                                                                                                                                                                                   |
+| **`mimeType`**         | <code>string</code>                        | MIME-тип файла.                                                                                                                                                                                                                                                                                                                            |
+| **`fileSize`**         | <code>number</code>                        | Размер файла в байтах.                                                                                                                                                                                                                                                                                                                     |
+| **`fileName`**         | <code>string</code>                        | Имя файла.                                                                                                                                                                                                                                                                                                                                 |
+| **`title`**            | <code>string</code>                        | Название трека (заполняется только для `audio`).                                                                                                                                                                                                                                                                                           |
+| **`artist`**           | <code>string</code>                        | Исполнитель (заполняется только для `audio`).                                                                                                                                                                                                                                                                                              |
+| **`album`**            | <code>string</code>                        | Альбом трека (заполняется только для `audio`).                                                                                                                                                                                                                                                                                             |
 
 
 #### GetMediaOptions
 
-| Prop          | Type                                            | Description                                              |
-| ------------- | ----------------------------------------------- | -------------------------------------------------------- |
-| **`albumId`** | <code>string</code>                             | ID альбома. Если не передан — возвращает все медиафайлы. |
-| **`limit`**   | <code>number</code>                             | Максимальное количество элементов.                       |
-| **`offset`**  | <code>number</code>                             | Сдвиг для пагинации.                                     |
-| **`type`**    | <code><a href="#mediatype">MediaType</a></code> | Тип медиа: `photo`, `video`, `audio` или `all`.          |
+| Prop          | Type                                            | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ------------- | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`albumId`** | <code>string</code>                             | ID альбома. Если не передан — возвращает все медиафайлы.                                                                                                                                                                                                                                                                                                                                                                                                       |
+| **`limit`**   | <code>number</code>                             | Максимальное количество элементов.                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| **`offset`**  | <code>number</code>                             | Сдвиг для offset-пагинации. Игнорируется, если передан `cursor`.                                                                                                                                                                                                                                                                                                                                                                                               |
+| **`type`**    | <code><a href="#mediatype">MediaType</a></code> | Тип медиа: `photo`, `video`, `audio` или `all`.                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **`cursor`**  | <code>string</code>                             | Курсор для cursor-based пагинации, полученный в `nextCursor` предыдущего ответа. Имеет приоритет над `offset`. Cursor-пагинация даёт **O(log n)** на гигантских галереях (50k+ файлов) против O(offset) у offset-режима. Используйте её для бесконечного скролла. Ограничение: при `type: 'all'` курсор работает не оптимально (внутри мержатся две коллекции) — для очень больших галерей лучше использовать раздельные `photo` / `video` запросы или offset. |
+
+
+#### HasMediaResult
+
+| Prop            | Type                 | Description                                                |
+| --------------- | -------------------- | ---------------------------------------------------------- |
+| **`available`** | <code>boolean</code> | `true`, если в выбранной коллекции есть хотя бы один файл. |
+
+
+#### HasMediaOptions
+
+| Prop       | Type                                            |
+| ---------- | ----------------------------------------------- |
+| **`type`** | <code><a href="#mediatype">MediaType</a></code> |
+
+
+#### ResolveMediaPathResult
+
+| Prop          | Type                        | Description                                                                |
+| ------------- | --------------------------- | -------------------------------------------------------------------------- |
+| **`uri`**     | <code>string</code>         | Нативный URI (тот же, что у <a href="#mediaitem">`MediaItem.uri`</a>).     |
+| **`webPath`** | <code>string \| null</code> | WebView-URL для `&lt;img/video src&gt;`. `null`, если получить не удалось. |
+
+
+#### ResolveMediaPathOptions
+
+| Prop     | Type                | Description                                               |
+| -------- | ------------------- | --------------------------------------------------------- |
+| **`id`** | <code>string</code> | ID медиафайла из <a href="#mediaitem">`MediaItem.id`</a>. |
 
 
 #### GetThumbnailResult
 
-| Prop               | Type                | Description                                                                                                          |
-| ------------------ | ------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| **`webPath`**      | <code>string</code> | URL для `&lt;img src&gt;`. Пустая строка, если миниатюру не удалось сгенерировать (например, для аудио без обложки). |
-| **`base64String`** | <code>string</code> | Base64-data-URL. Пустая строка, если `returnBase64` не запрошен.                                                     |
+| Prop               | Type                | Description                                                                                                                                       |
+| ------------------ | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`webPath`**      | <code>string</code> | URL для `&lt;img src&gt;`. Пустая строка, если миниатюру не удалось сгенерировать (например, для аудио без обложки или DRM-track из Apple Music). |
+| **`base64String`** | <code>string</code> | Base64-data-URL. Пустая строка, если `returnBase64` не запрошен.                                                                                  |
 
 
 #### GetThumbnailOptions
 
-| Prop               | Type                 | Description                                                                                                                                       |
-| ------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`id`**           | <code>string</code>  | ID медиафайла.                                                                                                                                    |
-| **`returnBase64`** | <code>boolean</code> | Если `true` — дополнительно вернуть `base64String` (legacy / fallback). По умолчанию `false` — возвращается только `webPath`, что в разы быстрее. |
-| **`size`**         | <code>number</code>  | Сторона квадратной миниатюры в пикселях. По умолчанию 256.                                                                                        |
+| Prop               | Type                 | Description                                                                                                                                                                                                                                                                                                           |
+| ------------------ | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`id`**           | <code>string</code>  | ID медиафайла.                                                                                                                                                                                                                                                                                                        |
+| **`returnBase64`** | <code>boolean</code> | Если `true` — дополнительно вернуть `base64String` (legacy / fallback). По умолчанию `false` — возвращается только `webPath`, что в разы быстрее.                                                                                                                                                                     |
+| **`size`**         | <code>number</code>  | Сторона квадратной миниатюры в DP / PT. По умолчанию 256.                                                                                                                                                                                                                                                             |
+| **`density`**      | <code>number</code>  | Множитель плотности экрана. На 3x-устройствах (iPhone Pro / Pixel) передавайте `window.devicePixelRatio` (обычно 2 или 3), чтобы миниатюра была чёткой, а не размытой при апскейле. Эффективный размер на диске = `size * density`. Кеш именован `thumb_&lt;id&gt;_&lt;size*density&gt;.webp\|jpg`. По умолчанию `1`. |
 
 
 #### GetThumbnailsResult
@@ -499,10 +803,11 @@ clearRecentFiles() => Promise<void>
 
 #### GetThumbnailsOptions
 
-| Prop       | Type                  | Description                                                |
-| ---------- | --------------------- | ---------------------------------------------------------- |
-| **`ids`**  | <code>string[]</code> | Массив ID медиафайлов.                                     |
-| **`size`** | <code>number</code>   | Сторона квадратной миниатюры в пикселях. По умолчанию 256. |
+| Prop          | Type                  | Description                                                                                       |
+| ------------- | --------------------- | ------------------------------------------------------------------------------------------------- |
+| **`ids`**     | <code>string[]</code> | Массив ID медиафайлов.                                                                            |
+| **`size`**    | <code>number</code>   | Сторона квадратной миниатюры в DP / PT. По умолчанию 256.                                         |
+| **`density`** | <code>number</code>   | Множитель плотности экрана. См. <a href="#getthumbnailoptions">`GetThumbnailOptions.density`</a>. |
 
 
 #### PickFilesResult
@@ -572,11 +877,44 @@ clearRecentFiles() => Promise<void>
 | **`id`** | <code>string</code> | ID записи (<a href="#pickedfile">`PickedFile.id`</a>), которую нужно повторно открыть. |
 
 
+#### ReadFileChunkResult
+
+| Prop            | Type                 | Description                                                                    |
+| --------------- | -------------------- | ------------------------------------------------------------------------------ |
+| **`data`**      | <code>string</code>  | Прочитанные байты в Base64.                                                    |
+| **`bytesRead`** | <code>number</code>  | Реально прочитанное количество байт. Может быть меньше `length` в конце файла. |
+| **`eof`**       | <code>boolean</code> | `true`, если достигли конца файла.                                             |
+| **`totalSize`** | <code>number</code>  | Полный размер файла в байтах (тот же на каждом chunk).                         |
+
+
+#### ReadFileChunkOptions
+
+| Prop         | Type                | Description                                                                                                                                                     |
+| ------------ | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`id`**     | <code>string</code> | ID записи (<a href="#pickedfile">`PickedFile.id`</a>).                                                                                                          |
+| **`offset`** | <code>number</code> | Смещение в файле в байтах. По умолчанию 0.                                                                                                                      |
+| **`length`** | <code>number</code> | Максимальное количество байт за чтение. По умолчанию 1 МБ (1 048 576). Рекомендуется не превышать 4 МБ, иначе base64-overhead и JS-мост дают заметную задержку. |
+
+
 #### RemoveRecentFileOptions
 
 | Prop     | Type                | Description                                                                                |
 | -------- | ------------------- | ------------------------------------------------------------------------------------------ |
 | **`id`** | <code>string</code> | ID записи (<a href="#pickedfile">`PickedFile.id`</a>), которую нужно убрать из «недавних». |
+
+
+#### PluginListenerHandle
+
+| Prop         | Type                                      |
+| ------------ | ----------------------------------------- |
+| **`remove`** | <code>() =&gt; Promise&lt;void&gt;</code> |
+
+
+#### MediaLibraryChangeEvent
+
+| Prop        | Type                                  | Description                                                                                                                                          |
+| ----------- | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`types`** | <code>MediaLibraryChangeType[]</code> | Какие коллекции изменились. Из-за дебаунса 500ms одно событие может содержать несколько типов (например, юзер удалил несколько фото и видео подряд). |
 
 
 ### Type Aliases
@@ -612,5 +950,12 @@ clearRecentFiles() => Promise<void>
 Construct a type with a set of properties K of type T
 
 <code>{ [P in K]: T; }</code>
+
+
+#### MediaLibraryChangeType
+
+Какой тип медиа изменился.
+
+<code>'photo' | 'video' | 'audio'</code>
 
 </docgen-api>

@@ -5,6 +5,7 @@ import android.content.ContentUris
 import android.content.Context
 import android.database.Cursor
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -13,11 +14,19 @@ import android.util.Base64
 import android.util.Size
 import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -26,6 +35,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import kotlin.math.max
+import kotlin.math.roundToInt
 
 /**
  * MediaGallery — бизнес-логика доступа к медиагалерее устройства.
@@ -34,8 +45,14 @@ import java.util.TimeZone
  *  - photo / video — из `MediaStore.Images` и `MediaStore.Video`
  *  - audio          — из `MediaStore.Audio` (системная музыкальная библиотека)
  *
- * Все публичные методы — `suspend`, чтобы вызывающий плагин запускал их в
- * `Dispatchers.IO` и не блокировал bridge-поток Capacitor.
+ * Ключевые оптимизации:
+ *  - WebP для миниатюр (на 25–30% меньше JPEG, быстрее decode на webview).
+ *  - `Semaphore(6)` для пакетных запросов миниатюр — не перегружает IO-пул.
+ *  - Cursor-based pagination для гигантских галерей (O(log n) против O(offset)).
+ *  - Поддержка density: миниатюра хранится в `size * density` пикселях,
+ *    чтобы на 3x-экранах не было апскейл-замыливания.
+ *  - Все публичные методы — `suspend`, корректно реагируют на cancellation
+ *    (см. [CapacitorMediastorePlugin.cancelPendingThumbnails]).
  */
 class MediaGallery(private val context: Context) {
 
@@ -46,8 +63,15 @@ class MediaGallery(private val context: Context) {
         File(context.cacheDir, "mediastore_thumbs").apply { if (!exists()) mkdirs() }
     }
 
+    /**
+     * Ограничивает параллелизм миниатюр-декодов. 6 одновременных задач — sweet spot
+     * между throughput и risk-of-jank на mid-tier устройствах.
+     */
+    private val thumbnailSemaphore = Semaphore(6)
+
     companion object {
         private const val DEFAULT_THUMB_SIZE = 256
+        private const val THUMB_QUALITY = 75
 
         /** Legacy URI обложек аудио-альбомов — используется на API < 29. */
         @Suppress("DEPRECATION")
@@ -57,10 +81,19 @@ class MediaGallery(private val context: Context) {
             get() = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
                 timeZone = TimeZone.getTimeZone("UTC")
             }
+
+        /**
+         * `Bitmap.CompressFormat.WEBP_LOSSY` доступен с API 30 (Android 11).
+         * На более старых API используем deprecated `WEBP` с тем же качеством.
+         */
+        @Suppress("DEPRECATION")
+        private val WEBP_FORMAT: Bitmap.CompressFormat =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Bitmap.CompressFormat.WEBP_LOSSY
+            else Bitmap.CompressFormat.WEBP
     }
 
     // ────────────────────────────────────────────────────────────────────────
-    // API
+    // Albums
     // ────────────────────────────────────────────────────────────────────────
 
     suspend fun getAlbums(): JSObject = withContext(Dispatchers.IO) {
@@ -73,10 +106,13 @@ class MediaGallery(private val context: Context) {
         val coverPaths: Map<String, String?> = coroutineScope {
             albums.values.map { info ->
                 async(Dispatchers.IO) {
-                    val path = if (info.coverUri != null && info.coverId != null) {
-                        getOrCreateThumbnailFile(info.coverId, info.coverUri, info.coverIsVideo, DEFAULT_THUMB_SIZE)
-                    } else null
-                    info.id to path
+                    thumbnailSemaphore.withPermit {
+                        if (info.coverUri != null && info.coverId != null) {
+                            getOrCreateThumbnailFile(
+                                info.coverId, info.coverUri, info.coverIsVideo, DEFAULT_THUMB_SIZE, 1.0
+                            )
+                        } else null
+                    }.let { path -> info.id to path }
                 }
             }.awaitAll().toMap()
         }
@@ -95,17 +131,27 @@ class MediaGallery(private val context: Context) {
         JSObject().apply { put("albums", arr) }
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Media (offset + cursor pagination)
+    // ────────────────────────────────────────────────────────────────────────
+
     /**
-     * Возвращает страницу медиа, отсортированную по дате добавления (DESC).
-     *
      * Семантика `albumId`:
      *  - для `photo` / `video` — фильтрует по `BUCKET_ID` (папке галереи).
      *  - для `audio` — игнорируется (у аудио нет «папок» в смысле галереи).
-     *  - для `all` — применяется только к photo/video, audio добавляется целиком.
+     *  - для `all` — применяется только к photo/video.
+     *
+     * Семантика `cursor`:
+     *  - если передан — используется cursor-based pagination (O(log n)).
+     *  - если пуст — используется offset-режим (offset/limit).
      */
-    suspend fun getMedia(albumId: String?, limit: Int, offset: Int, type: String): JSObject = withContext(Dispatchers.IO) {
-        // `all` намеренно НЕ включает audio — аудио живёт в отдельной вкладке UI
-        // (как в Telegram). Чтобы получить аудио — передавайте `type: 'audio'`.
+    suspend fun getMedia(
+        albumId: String?,
+        limit: Int,
+        offset: Int,
+        type: String,
+        cursor: String?
+    ): JSObject = withContext(Dispatchers.IO) {
         val collections = when (type) {
             "photo" -> listOf(CollectionInfo(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "photo"))
             "video" -> listOf(CollectionInfo(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, "video"))
@@ -116,45 +162,124 @@ class MediaGallery(private val context: Context) {
             )
         }
 
-        // 1. total — считаем дёшево, без выборки.
         var total = 0
         for (col in collections) {
-            // BUCKET_ID не применяется к audio.
             val filterAlbum = if (col.type == "audio") null else albumId
             total += countMedia(col.uri, filterAlbum)
         }
 
-        // 2. Каждая коллекция отдаёт уже отсортированный курсор с лимитом (offset+limit).
-        //    Затем сливаем потоки merge-sort'ом по dateAdded и берём срез [offset, offset+limit).
-        val perCollectionTake = offset + limit
+        val cursorPos: CursorPosition? = if (cursor.isNullOrEmpty()) null else decodeCursor(cursor)
+        val perCollectionTake = if (cursorPos != null) limit else (offset + limit)
+
         val streams: List<List<JSObject>> = collections.map { col ->
             val filterAlbum = if (col.type == "audio") null else albumId
-            queryMediaPage(col.uri, col.type, filterAlbum, perCollectionTake)
+            queryMediaPage(col.uri, col.type, filterAlbum, perCollectionTake, cursorPos)
         }
         val merged = mergeByCreatedAtDesc(streams)
-        val end = minOf(offset + limit, merged.size)
-        val page = if (offset < merged.size) merged.subList(offset, end) else emptyList()
+
+        val page: List<JSObject> = if (cursorPos != null) {
+            // cursor-режим: страница уже отфильтрована на уровне SQL, режем по limit.
+            merged.take(limit)
+        } else {
+            val end = minOf(offset + limit, merged.size)
+            if (offset < merged.size) merged.subList(offset, end) else emptyList()
+        }
 
         val arr = JSArray()
         for (item in page) arr.put(item)
 
+        // Следующий курсор — last item в странице.
+        val nextCursor: String? = if (page.isNotEmpty() && page.size == limit) {
+            val last = page.last()
+            val lastDate = last.optString("_dateAddedRaw", "0").toLongOrNull() ?: 0L
+            val lastId = last.optString("id", "0")
+            // Удаляем служебное поле перед отдачей.
+            for (i in 0 until arr.length()) {
+                (arr.get(i) as JSObject).remove("_dateAddedRaw")
+            }
+            encodeCursor(CursorPosition(lastDate, lastId))
+        } else {
+            for (i in 0 until arr.length()) {
+                (arr.get(i) as JSObject).remove("_dateAddedRaw")
+            }
+            null
+        }
+
+        val hasMore: Boolean = if (cursorPos != null) {
+            nextCursor != null
+        } else {
+            offset + limit < total
+        }
+
         JSObject().apply {
             put("media", arr)
             put("total", total)
-            put("hasMore", offset + limit < total)
+            put("hasMore", hasMore)
+            put("nextCursor", nextCursor)
         }
     }
 
     /**
-     * Lazy load thumbnail: возвращает webPath (file URL) и опционально base64.
-     * Для аудио возвращает обложку альбома, если она существует.
+     * Дешёвая проверка: есть ли в коллекции хотя бы один файл?
+     * На API 30+ использует `QUERY_ARG_LIMIT=1`, на старых — обычный count.
      */
-    suspend fun getThumbnail(id: String, returnBase64: Boolean, size: Int): JSObject = withContext(Dispatchers.IO) {
+    suspend fun hasMedia(type: String): Boolean = withContext(Dispatchers.IO) {
+        val uris = when (type) {
+            "photo" -> listOf(MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
+            "video" -> listOf(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+            "audio" -> listOf(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
+            else -> listOf(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            )
+        }
+        for (uri in uris) {
+            val projection = arrayOf(MediaStore.MediaColumns._ID)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val args = Bundle().apply { putInt(ContentResolver.QUERY_ARG_LIMIT, 1) }
+                contentResolver.query(uri, projection, args, null)?.use { c ->
+                    if (c.moveToFirst()) return@withContext true
+                }
+            } else {
+                contentResolver.query(uri, projection, null, null, "_id DESC LIMIT 1")?.use { c ->
+                    if (c.moveToFirst()) return@withContext true
+                }
+            }
+        }
+        false
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Resolve full-size path (для совместимости с iOS API; на Android уже есть)
+    // ────────────────────────────────────────────────────────────────────────
+
+    suspend fun resolveMediaPath(id: String): JSObject = withContext(Dispatchers.IO) {
+        val mediaId = id.toLongOrNull() ?: throw IllegalArgumentException("Invalid ID")
+        val info = getUriAndType(mediaId) ?: throw IllegalArgumentException("Media not found")
+        JSObject().apply {
+            put("uri", info.uri.toString())
+            put("webPath", contentUriToWebPath(info.uri.toString()))
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Thumbnails (Lazy Load + Prefetch + Cancellation)
+    // ────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Lazy-load одной миниатюры. Cancellation-aware.
+     */
+    suspend fun getThumbnail(id: String, returnBase64: Boolean, size: Int, density: Double): JSObject = withContext(Dispatchers.IO) {
         val mediaId = id.toLongOrNull() ?: throw IllegalArgumentException("Invalid ID")
         val info = getUriAndType(mediaId) ?: throw IllegalArgumentException("Media not found")
 
-        val effectiveSize = if (size > 0) size else DEFAULT_THUMB_SIZE
-        val webPath = getOrCreateThumbnailFile(mediaId, info.uri.toString(), info.isVideo, effectiveSize, info.isAudio, info.albumId) ?: ""
+        val effectiveSize = effectiveThumbSize(size, density)
+        val webPath = thumbnailSemaphore.withPermit {
+            currentCoroutineContext().ensureActive()
+            getOrCreateThumbnailFile(
+                mediaId, info.uri.toString(), info.isVideo, effectiveSize, 1.0, info.isAudio, info.albumId
+            )
+        } ?: ""
         val base64 = if (returnBase64 && webPath.isNotEmpty()) readCachedAsBase64DataUrl(mediaId, effectiveSize) else ""
 
         JSObject().apply {
@@ -164,20 +289,28 @@ class MediaGallery(private val context: Context) {
     }
 
     /**
-     * Пакетная генерация миниатюр.
+     * Пакетная генерация миниатюр. Cancellation-aware: если родительский Job
+     * отменён через [CapacitorMediastorePlugin.cancelPendingThumbnails], уже
+     * не запущенные задачи прерываются, готовые — остаются в кеше.
      */
-    suspend fun getThumbnails(ids: List<String>, size: Int): JSObject = withContext(Dispatchers.IO) {
-        val effectiveSize = if (size > 0) size else DEFAULT_THUMB_SIZE
+    suspend fun getThumbnails(ids: List<String>, size: Int, density: Double): JSObject = withContext(Dispatchers.IO) {
+        val effectiveSize = effectiveThumbSize(size, density)
 
         val results: List<Pair<String, String?>> = coroutineScope {
             ids.map { rawId ->
                 async(Dispatchers.IO) {
-                    val mediaId = rawId.toLongOrNull() ?: return@async rawId to null
-                    val info = getUriAndType(mediaId) ?: return@async rawId to null
-                    val path = try {
-                        getOrCreateThumbnailFile(mediaId, info.uri.toString(), info.isVideo, effectiveSize, info.isAudio, info.albumId)
-                    } catch (_: Exception) { null }
-                    rawId to path
+                    thumbnailSemaphore.withPermit {
+                        if (!isActive) return@async rawId to null
+                        val mediaId = rawId.toLongOrNull() ?: return@async rawId to null
+                        val info = getUriAndType(mediaId) ?: return@async rawId to null
+                        val path = try {
+                            getOrCreateThumbnailFile(
+                                mediaId, info.uri.toString(), info.isVideo, effectiveSize, 1.0, info.isAudio, info.albumId
+                            )
+                        } catch (e: CancellationException) { throw e }
+                          catch (_: Exception) { null }
+                        rawId to path
+                    }
                 }
             }.awaitAll()
         }
@@ -189,8 +322,38 @@ class MediaGallery(private val context: Context) {
         JSObject().apply { put("thumbnails", map) }
     }
 
+    /**
+     * Прогревает кеш миниатюр в фоне — НЕ блокирует caller'а.
+     * Идентичен `getThumbnails`, но результат не возвращается.
+     */
+    suspend fun prefetchThumbnails(ids: List<String>, size: Int, density: Double) {
+        val effectiveSize = effectiveThumbSize(size, density)
+        coroutineScope {
+            ids.forEach { rawId ->
+                launch(Dispatchers.IO) {
+                    thumbnailSemaphore.withPermit {
+                        if (!isActive) return@withPermit
+                        val mediaId = rawId.toLongOrNull() ?: return@withPermit
+                        val info = getUriAndType(mediaId) ?: return@withPermit
+                        try {
+                            getOrCreateThumbnailFile(
+                                mediaId, info.uri.toString(), info.isVideo, effectiveSize, 1.0, info.isAudio, info.albumId
+                            )
+                        } catch (_: Exception) { /* swallow */ }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun effectiveThumbSize(size: Int, density: Double): Int {
+        val s = if (size > 0) size else DEFAULT_THUMB_SIZE
+        val d = if (density > 0) density else 1.0
+        return (s * d).roundToInt().coerceAtLeast(32)
+    }
+
     // ────────────────────────────────────────────────────────────────────────
-    // Private Logic
+    // Private query logic
     // ────────────────────────────────────────────────────────────────────────
 
     private data class MediaInfo(val uri: Uri, val isVideo: Boolean, val isAudio: Boolean, val albumId: Long?)
@@ -260,44 +423,66 @@ class MediaGallery(private val context: Context) {
         return 0
     }
 
-    private fun queryMediaPage(collection: Uri, mediaType: String, albumId: String?, take: Int): List<JSObject> {
+    /**
+     * Курсор-страница, отсортированная по `(DATE_ADDED DESC, _ID DESC)`.
+     * Поддерживает album-filter и cursor (`date < ? OR (date = ? AND _id < ?)`).
+     */
+    private fun queryMediaPage(
+        collection: Uri,
+        mediaType: String,
+        albumId: String?,
+        take: Int,
+        cursor: CursorPosition?
+    ): List<JSObject> {
         val out = mutableListOf<JSObject>()
         val projection = buildMediaProjection(mediaType)
 
+        // Build selection
+        val selParts = mutableListOf<String>()
+        val selArgs = mutableListOf<String>()
+        if (!albumId.isNullOrEmpty()) {
+            selParts.add("${MediaStore.MediaColumns.BUCKET_ID} = ?")
+            selArgs.add(albumId)
+        }
+        if (cursor != null) {
+            selParts.add(
+                "(${MediaStore.MediaColumns.DATE_ADDED} < ? OR " +
+                    "(${MediaStore.MediaColumns.DATE_ADDED} = ? AND ${MediaStore.MediaColumns._ID} < ?))"
+            )
+            selArgs.add(cursor.dateAdded.toString())
+            selArgs.add(cursor.dateAdded.toString())
+            selArgs.add(cursor.lastId)
+        }
+        val selection = if (selParts.isEmpty()) null else selParts.joinToString(" AND ")
+        val selectionArgs = if (selArgs.isEmpty()) null else selArgs.toTypedArray()
+
+        // Sort + limit. На API 26+ можно использовать Bundle-аргументы.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val args = Bundle().apply {
-                if (!albumId.isNullOrEmpty()) {
-                    putString(ContentResolver.QUERY_ARG_SQL_SELECTION, "${MediaStore.MediaColumns.BUCKET_ID} = ?")
-                    putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, arrayOf(albumId))
+                if (selection != null) {
+                    putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selection)
+                    putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, selectionArgs)
                 }
-                putStringArray(
-                    ContentResolver.QUERY_ARG_SORT_COLUMNS,
-                    arrayOf(MediaStore.MediaColumns.DATE_ADDED)
-                )
-                putInt(
-                    ContentResolver.QUERY_ARG_SORT_DIRECTION,
-                    ContentResolver.QUERY_SORT_DIRECTION_DESCENDING
+                // Multi-column sort через QUERY_ARG_SQL_SORT_ORDER (legacy форма).
+                putString(
+                    ContentResolver.QUERY_ARG_SQL_SORT_ORDER,
+                    "${MediaStore.MediaColumns.DATE_ADDED} DESC, ${MediaStore.MediaColumns._ID} DESC"
                 )
                 putInt(ContentResolver.QUERY_ARG_LIMIT, take)
                 putInt(ContentResolver.QUERY_ARG_OFFSET, 0)
             }
-            contentResolver.query(collection, projection, args, null)?.use { cursor ->
-                while (cursor.moveToNext()) out.add(cursorToMediaItem(cursor, collection, mediaType))
+            contentResolver.query(collection, projection, args, null)?.use { c ->
+                while (c.moveToNext()) out.add(cursorToMediaItem(c, collection, mediaType))
             }
         } else {
-            val selection = albumId?.let { "${MediaStore.MediaColumns.BUCKET_ID} = ?" }
-            val selectionArgs = albumId?.let { arrayOf(it) }
-            val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC LIMIT $take"
-            contentResolver.query(collection, projection, selection, selectionArgs, sortOrder)?.use { cursor ->
-                while (cursor.moveToNext()) out.add(cursorToMediaItem(cursor, collection, mediaType))
+            val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC, ${MediaStore.MediaColumns._ID} DESC LIMIT $take"
+            contentResolver.query(collection, projection, selection, selectionArgs, sortOrder)?.use { c ->
+                while (c.moveToNext()) out.add(cursorToMediaItem(c, collection, mediaType))
             }
         }
         return out
     }
 
-    /**
-     * Сливает несколько уже-DESC-отсортированных списков в один DESC-список по `createdAt`.
-     */
     private fun mergeByCreatedAtDesc(streams: List<List<JSObject>>): List<JSObject> {
         if (streams.size == 1) return streams[0]
         val cursors = IntArray(streams.size)
@@ -333,6 +518,9 @@ class MediaGallery(private val context: Context) {
             base.add(MediaStore.MediaColumns.WIDTH)
             base.add(MediaStore.MediaColumns.HEIGHT)
             base.add(MediaStore.MediaColumns.BUCKET_ID)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                base.add(MediaStore.MediaColumns.ORIENTATION)
+            }
         }
         when (mediaType) {
             "video" -> base.add(MediaStore.Video.VideoColumns.DURATION)
@@ -352,9 +540,17 @@ class MediaGallery(private val context: Context) {
         val displayName = cursor.getStringOrNull(MediaStore.MediaColumns.DISPLAY_NAME) ?: ""
         val mimeType = cursor.getStringOrNull(MediaStore.MediaColumns.MIME_TYPE) ?: ""
         val size = cursor.getLongOrZero(MediaStore.MediaColumns.SIZE)
-        val width = cursor.getIntOrZero(MediaStore.MediaColumns.WIDTH)
-        val height = cursor.getIntOrZero(MediaStore.MediaColumns.HEIGHT)
+        var width = cursor.getIntOrZero(MediaStore.MediaColumns.WIDTH)
+        var height = cursor.getIntOrZero(MediaStore.MediaColumns.HEIGHT)
         val dateAdded = cursor.getLongOrZero(MediaStore.MediaColumns.DATE_ADDED)
+        val orientation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && mediaType != "audio") {
+            cursor.getIntOrZero(MediaStore.MediaColumns.ORIENTATION)
+        } else 0
+
+        // На некоторых девайсах WIDTH/HEIGHT в MediaStore до-rotation; нормализуем.
+        if (orientation == 90 || orientation == 270) {
+            val tmp = width; width = height; height = tmp
+        }
 
         val duration = when (mediaType) {
             "video" -> {
@@ -380,11 +576,16 @@ class MediaGallery(private val context: Context) {
             put("thumbnailWebPath", null)
             put("width", width)
             put("height", height)
+            put("orientation", orientation)
+            put("isLivePhoto", false)
+            put("isHDR", false)
             put("createdAt", createdAt)
             put("duration", duration)
             put("mimeType", mimeType)
             put("fileSize", size)
             put("fileName", displayName)
+            // Служебное поле — снимается перед отдачей в JS.
+            put("_dateAddedRaw", dateAdded.toString())
         }
 
         if (mediaType == "audio") {
@@ -405,19 +606,20 @@ class MediaGallery(private val context: Context) {
         }
     }
 
-    /**
-     * Возвращает webPath к закешированному файлу миниатюры (или null).
-     * Для аудио пытается загрузить обложку альбома через ALBUM_ART_URI / loadThumbnail.
-     */
+    // ────────────────────────────────────────────────────────────────────────
+    // Thumbnail file generation (WebP)
+    // ────────────────────────────────────────────────────────────────────────
+
     private fun getOrCreateThumbnailFile(
         mediaId: Long,
         contentUriStr: String,
         isVideo: Boolean,
         size: Int = DEFAULT_THUMB_SIZE,
+        @Suppress("UNUSED_PARAMETER") legacyDensity: Double = 1.0,
         isAudio: Boolean = false,
         audioAlbumId: Long? = null
     ): String? {
-        val thumbFile = File(thumbDir, "thumb_${mediaId}_${size}.jpg")
+        val thumbFile = File(thumbDir, "thumb_${mediaId}_${size}.webp")
         if (thumbFile.exists() && thumbFile.length() > 0) {
             return "https://localhost/_capacitor_file_" + thumbFile.absolutePath
         }
@@ -432,26 +634,30 @@ class MediaGallery(private val context: Context) {
                 } catch (_: Exception) { }
             }
             if (bitmap == null && isAudio && audioAlbumId != null) {
-                // Fallback на legacy ALBUM_ART_URI для API < 29.
                 try {
                     val artUri = ContentUris.withAppendedId(ALBUM_ART_URI, audioAlbumId)
                     contentResolver.openInputStream(artUri)?.use { input ->
-                        bitmap = android.graphics.BitmapFactory.decodeStream(input)
+                        bitmap = BitmapFactory.decodeStream(input)
                     }
                 } catch (_: Exception) { }
             }
             if (bitmap == null && !isAudio) {
-                if (isVideo) {
-                    @Suppress("DEPRECATION")
-                    bitmap = MediaStore.Video.Thumbnails.getThumbnail(contentResolver, mediaId, MediaStore.Video.Thumbnails.MINI_KIND, null)
+                @Suppress("DEPRECATION")
+                bitmap = if (isVideo) {
+                    MediaStore.Video.Thumbnails.getThumbnail(
+                        contentResolver, mediaId, MediaStore.Video.Thumbnails.MINI_KIND, null
+                    )
                 } else {
-                    @Suppress("DEPRECATION")
-                    bitmap = MediaStore.Images.Thumbnails.getThumbnail(contentResolver, mediaId, MediaStore.Images.Thumbnails.MINI_KIND, null)
+                    MediaStore.Images.Thumbnails.getThumbnail(
+                        contentResolver, mediaId, MediaStore.Images.Thumbnails.MINI_KIND, null
+                    )
                 }
             }
 
             if (bitmap != null) {
-                FileOutputStream(thumbFile).use { out -> bitmap!!.compress(Bitmap.CompressFormat.JPEG, 70, out) }
+                FileOutputStream(thumbFile).use { out ->
+                    bitmap!!.compress(WEBP_FORMAT, THUMB_QUALITY, out)
+                }
                 return "https://localhost/_capacitor_file_" + thumbFile.absolutePath
             }
         } catch (_: Exception) { }
@@ -459,21 +665,49 @@ class MediaGallery(private val context: Context) {
     }
 
     private fun readCachedAsBase64DataUrl(mediaId: Long, size: Int): String {
-        val thumbFile = File(thumbDir, "thumb_${mediaId}_${size}.jpg")
+        val thumbFile = File(thumbDir, "thumb_${mediaId}_${size}.webp")
         if (!thumbFile.exists()) return ""
         return try {
             FileInputStream(thumbFile).use { fis ->
-                val baos = ByteArrayOutputStream(thumbFile.length().toInt().coerceAtLeast(1024))
+                val baos = ByteArrayOutputStream(max(thumbFile.length().toInt(), 1024))
                 val buf = ByteArray(8 * 1024)
                 while (true) {
                     val n = fis.read(buf); if (n <= 0) break
                     baos.write(buf, 0, n)
                 }
                 val b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-                "data:image/jpeg;base64,$b64"
+                "data:image/webp;base64,$b64"
             }
         } catch (_: Exception) { "" }
     }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Cursor encoding
+    // ────────────────────────────────────────────────────────────────────────
+
+    private data class CursorPosition(val dateAdded: Long, val lastId: String)
+
+    private fun encodeCursor(pos: CursorPosition): String {
+        val raw = JSONObject().apply {
+            put("d", pos.dateAdded)
+            put("i", pos.lastId)
+        }.toString()
+        return Base64.encodeToString(raw.toByteArray(), Base64.NO_WRAP or Base64.URL_SAFE)
+    }
+
+    private fun decodeCursor(token: String): CursorPosition? {
+        return try {
+            val raw = String(Base64.decode(token, Base64.NO_WRAP or Base64.URL_SAFE))
+            val obj = JSONObject(raw)
+            CursorPosition(obj.getLong("d"), obj.getString("i"))
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Cursor helpers
+    // ────────────────────────────────────────────────────────────────────────
 
     private fun Cursor.getStringOrNull(columnName: String): String? {
         val idx = getColumnIndex(columnName)

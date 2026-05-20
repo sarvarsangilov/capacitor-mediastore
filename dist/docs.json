@@ -53,12 +53,50 @@
         ],
         "returns": "Promise<GetMediaResult>",
         "tags": [],
-        "docs": "Возвращает список медиафайлов с метаданными (БЕЗ миниатюр).\nПри `type: 'audio'` возвращает треки из системной музыкальной библиотеки.",
+        "docs": "Возвращает список медиафайлов с метаданными (БЕЗ миниатюр).\nПри `type: 'audio'` возвращает треки из системной музыкальной библиотеки.\n\nПоддерживает два режима пагинации:\n - **offset** (поля `limit` / `offset`) — удобно для прыжков в произвольное место.\n - **cursor** (поле `cursor`, приоритет над offset) — O(log n) для гигантских галерей.",
         "complexTypes": [
           "GetMediaResult",
           "GetMediaOptions"
         ],
         "slug": "getmedia"
+      },
+      {
+        "name": "hasMedia",
+        "signature": "(options: HasMediaOptions) => Promise<HasMediaResult>",
+        "parameters": [
+          {
+            "name": "options",
+            "docs": "",
+            "type": "HasMediaOptions"
+          }
+        ],
+        "returns": "Promise<HasMediaResult>",
+        "tags": [],
+        "docs": "Дешёвая проверка: есть ли в коллекции хоть один файл?\nИспользуйте на старте приложения, чтобы решить, показывать ли вкладку.\nНе загружает метаданные.",
+        "complexTypes": [
+          "HasMediaResult",
+          "HasMediaOptions"
+        ],
+        "slug": "hasmedia"
+      },
+      {
+        "name": "resolveMediaPath",
+        "signature": "(options: ResolveMediaPathOptions) => Promise<ResolveMediaPathResult>",
+        "parameters": [
+          {
+            "name": "options",
+            "docs": "",
+            "type": "ResolveMediaPathOptions"
+          }
+        ],
+        "returns": "Promise<ResolveMediaPathResult>",
+        "tags": [],
+        "docs": "Лениво резолвит `webPath` для `MediaItem` на iOS (на Android всегда\nзаполнен в `getMedia`, метод возвращает уже готовое значение).\n\nПод капотом на iOS делает `requestContentEditingInput` /\n`requestAVAsset` — это **дорогая** операция (экспорт файла во временную\nпапку), поэтому вызывайте только в момент, когда пользователь реально\nоткрывает фото / видео.",
+        "complexTypes": [
+          "ResolveMediaPathResult",
+          "ResolveMediaPathOptions"
+        ],
+        "slug": "resolvemediapath"
       },
       {
         "name": "getThumbnail",
@@ -91,12 +129,40 @@
         ],
         "returns": "Promise<GetThumbnailsResult>",
         "tags": [],
-        "docs": "Пакетная генерация миниатюр (lazy load для виртуализированных списков).\nОдин нативный вызов = N миниатюр, чтобы устранить overhead JS-моста.",
+        "docs": "Пакетная генерация миниатюр (lazy load для виртуализированных списков).\nОдин нативный вызов = N миниатюр, чтобы устранить overhead JS-моста.\n\nНа обеих платформах ограничивает параллелизм (~6 одновременных декодов)\nи использует кеш `getOrCreateThumbnail*` — повторные запросы того же\n`id × size × density` отдаются мгновенно.",
         "complexTypes": [
           "GetThumbnailsResult",
           "GetThumbnailsOptions"
         ],
         "slug": "getthumbnails"
+      },
+      {
+        "name": "prefetchThumbnails",
+        "signature": "(options: GetThumbnailsOptions) => Promise<void>",
+        "parameters": [
+          {
+            "name": "options",
+            "docs": "",
+            "type": "GetThumbnailsOptions"
+          }
+        ],
+        "returns": "Promise<void>",
+        "tags": [],
+        "docs": "Прогревает кеш миниатюр в фоне. Возвращается **сразу** (промис резолвится\nпосле старта background-задач, не ждёт их завершения).\n\nИспользуйте в виртуализированном списке: при появлении в viewport\nэлементов 100-109 — стрельните prefetch для 110-130, чтобы к моменту\nскролла туда миниатюры уже были на диске.",
+        "complexTypes": [
+          "GetThumbnailsOptions"
+        ],
+        "slug": "prefetchthumbnails"
+      },
+      {
+        "name": "cancelPendingThumbnails",
+        "signature": "() => Promise<void>",
+        "parameters": [],
+        "returns": "Promise<void>",
+        "tags": [],
+        "docs": "Отменяет все pending-задачи на генерацию миниатюр, запущенные через\n`getThumbnails` / `prefetchThumbnails`. Уже завершённые миниатюры\nостаются в кеше.\n\nПолезно при быстром скролле: на смене страницы отменяете старые\nзапросы и запускаете новые, экономя CPU/батарею.",
+        "complexTypes": [],
+        "slug": "cancelpendingthumbnails"
       },
       {
         "name": "pickFiles",
@@ -156,6 +222,25 @@
         "slug": "resolverecentfile"
       },
       {
+        "name": "readFileChunk",
+        "signature": "(options: ReadFileChunkOptions) => Promise<ReadFileChunkResult>",
+        "parameters": [
+          {
+            "name": "options",
+            "docs": "",
+            "type": "ReadFileChunkOptions"
+          }
+        ],
+        "returns": "Promise<ReadFileChunkResult>",
+        "tags": [],
+        "docs": "Читает фрагмент файла из «недавних» (для streaming-загрузки больших файлов\nбез полной материализации в памяти).\n\nТипичный паттерн — загрузить PDF / video по чанкам с прогрессом:\n\n```ts\nlet offset = 0;\nwhile (true) {\n  const chunk = await CapacitorMediastore.readFileChunk({ id, offset, length: 1_000_000 });\n  // chunk.data — base64, decode и шлём в сеть/IndexedDB\n  offset += chunk.bytesRead;\n  if (chunk.eof) break;\n}\n```\n\nБез этого метода единственный способ прочитать большой файл — `fetch(webPath)`,\nкоторый загружает весь файл в память сразу (плохо для 500 МБ видео).",
+        "complexTypes": [
+          "ReadFileChunkResult",
+          "ReadFileChunkOptions"
+        ],
+        "slug": "readfilechunk"
+      },
+      {
         "name": "removeRecentFile",
         "signature": "(options: RemoveRecentFileOptions) => Promise<void>",
         "parameters": [
@@ -182,6 +267,40 @@
         "docs": "Очищает все «недавние» файлы. Отзывает все persistable permissions\n(Android) / удаляет все bookmarks (iOS). Сами файлы на диске НЕ удаляются.",
         "complexTypes": [],
         "slug": "clearrecentfiles"
+      },
+      {
+        "name": "addListener",
+        "signature": "(eventName: 'mediaLibraryChanged', listenerFunc: (event: MediaLibraryChangeEvent) => void) => Promise<PluginListenerHandle>",
+        "parameters": [
+          {
+            "name": "eventName",
+            "docs": "",
+            "type": "'mediaLibraryChanged'"
+          },
+          {
+            "name": "listenerFunc",
+            "docs": "",
+            "type": "(event: MediaLibraryChangeEvent) => void"
+          }
+        ],
+        "returns": "Promise<PluginListenerHandle>",
+        "tags": [],
+        "docs": "Подписка на изменения системной галереи (новые фото, удалённые видео и т.д.).\nСобытие приходит с дебаунсом 500ms, чтобы не спамить при batch-операциях.\n\n```ts\nconst handle = await CapacitorMediastore.addListener(\n  'mediaLibraryChanged',\n  ({ types }) => {\n    if (types.includes('photo')) refreshPhotosTab();\n  }\n);\n// при размонтировании\nhandle.remove();\n```",
+        "complexTypes": [
+          "PluginListenerHandle",
+          "MediaLibraryChangeEvent"
+        ],
+        "slug": "addlistenermedialibrarychanged-"
+      },
+      {
+        "name": "removeAllListeners",
+        "signature": "() => Promise<void>",
+        "parameters": [],
+        "returns": "Promise<void>",
+        "tags": [],
+        "docs": "Удаляет всех слушателей плагина.",
+        "complexTypes": [],
+        "slug": "removealllisteners"
       }
     ],
     "properties": []
@@ -321,6 +440,13 @@
           "docs": "Есть ли ещё элементы после текущей страницы.",
           "complexTypes": [],
           "type": "boolean"
+        },
+        {
+          "name": "nextCursor",
+          "tags": [],
+          "docs": "Курсор для следующей страницы. `null`, если страница последняя.\nПередавайте в `cursor` следующего запроса.",
+          "complexTypes": [],
+          "type": "string | null"
         }
       ]
     },
@@ -348,14 +474,14 @@
         {
           "name": "uri",
           "tags": [],
-          "docs": "URI / путь к полноразмерному файлу (нативный идентификатор).",
+          "docs": "Нативный URI / путь к полноразмерному файлу.",
           "complexTypes": [],
           "type": "string"
         },
         {
           "name": "webPath",
           "tags": [],
-          "docs": "URL, пригодный для `<img src>` / `<video src>` / `<audio src>` внутри WebView.\nНа Android: `https://localhost/_capacitor_content_/...`\nНа iOS: `capacitor://localhost/_capacitor_file_/tmp/...`\nНа Web: совпадает с `uri`.",
+          "docs": "URL для `<img/video/audio src>` внутри WebView.\n\nНа Android всегда заполнен (это бесплатное преобразование `content://`).\nНа iOS в `getMedia` возвращается `null` для скорости — реальный экспорт\nфото/видео из `Photos framework` делает [resolveMediaPath] лениво, по\nтребованию (когда пользователь действительно открывает файл).",
           "complexTypes": [],
           "type": "string | null"
         },
@@ -376,16 +502,37 @@
         {
           "name": "width",
           "tags": [],
-          "docs": "Ширина в пикселях (для аудио — 0).",
+          "docs": "Ширина в пикселях с учётом ориентации. Для аудио — 0.",
           "complexTypes": [],
           "type": "number"
         },
         {
           "name": "height",
           "tags": [],
-          "docs": "Высота в пикселях (для аудио — 0).",
+          "docs": "Высота в пикселях с учётом ориентации. Для аудио — 0.",
           "complexTypes": [],
           "type": "number"
+        },
+        {
+          "name": "orientation",
+          "tags": [],
+          "docs": "Поворот файла в градусах (0, 90, 180, 270).\nДля видео берётся из EXIF; для фото обычно 0 (Photos / MediaStore сами\nнормализуют ориентацию при выдаче битмапа).",
+          "complexTypes": [],
+          "type": "number"
+        },
+        {
+          "name": "isLivePhoto",
+          "tags": [],
+          "docs": "Live Photo (только iOS). На Android всегда `false`.\nUI может показать badge «LIVE» и проигрывать анимацию по long-press.",
+          "complexTypes": [],
+          "type": "boolean"
+        },
+        {
+          "name": "isHDR",
+          "tags": [],
+          "docs": "HDR-фото или Dolby Vision видео (только iOS). На Android всегда `false`.",
+          "complexTypes": [],
+          "type": "boolean"
         },
         {
           "name": "createdAt",
@@ -469,7 +616,7 @@
         {
           "name": "offset",
           "tags": [],
-          "docs": "Сдвиг для пагинации.",
+          "docs": "Сдвиг для offset-пагинации. Игнорируется, если передан `cursor`.",
           "complexTypes": [],
           "type": "number"
         },
@@ -481,6 +628,86 @@
             "MediaType"
           ],
           "type": "MediaType"
+        },
+        {
+          "name": "cursor",
+          "tags": [],
+          "docs": "Курсор для cursor-based пагинации, полученный в `nextCursor` предыдущего\nответа. Имеет приоритет над `offset`.\n\nCursor-пагинация даёт **O(log n)** на гигантских галереях (50k+ файлов)\nпротив O(offset) у offset-режима. Используйте её для бесконечного скролла.\n\nОграничение: при `type: 'all'` курсор работает не оптимально (внутри\nмержатся две коллекции) — для очень больших галерей лучше использовать\nраздельные `photo` / `video` запросы или offset.",
+          "complexTypes": [],
+          "type": "string | undefined"
+        }
+      ]
+    },
+    {
+      "name": "HasMediaResult",
+      "slug": "hasmediaresult",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "available",
+          "tags": [],
+          "docs": "`true`, если в выбранной коллекции есть хотя бы один файл.",
+          "complexTypes": [],
+          "type": "boolean"
+        }
+      ]
+    },
+    {
+      "name": "HasMediaOptions",
+      "slug": "hasmediaoptions",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "type",
+          "tags": [],
+          "docs": "",
+          "complexTypes": [
+            "MediaType"
+          ],
+          "type": "MediaType"
+        }
+      ]
+    },
+    {
+      "name": "ResolveMediaPathResult",
+      "slug": "resolvemediapathresult",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "uri",
+          "tags": [],
+          "docs": "Нативный URI (тот же, что у `MediaItem.uri`).",
+          "complexTypes": [],
+          "type": "string"
+        },
+        {
+          "name": "webPath",
+          "tags": [],
+          "docs": "WebView-URL для `<img/video src>`. `null`, если получить не удалось.",
+          "complexTypes": [],
+          "type": "string | null"
+        }
+      ]
+    },
+    {
+      "name": "ResolveMediaPathOptions",
+      "slug": "resolvemediapathoptions",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "id",
+          "tags": [],
+          "docs": "ID медиафайла из `MediaItem.id`.",
+          "complexTypes": [],
+          "type": "string"
         }
       ]
     },
@@ -494,7 +721,7 @@
         {
           "name": "webPath",
           "tags": [],
-          "docs": "URL для `<img src>`. Пустая строка, если миниатюру не удалось сгенерировать\n(например, для аудио без обложки).",
+          "docs": "URL для `<img src>`. Пустая строка, если миниатюру не удалось сгенерировать\n(например, для аудио без обложки или DRM-track из Apple Music).",
           "complexTypes": [],
           "type": "string"
         },
@@ -531,7 +758,14 @@
         {
           "name": "size",
           "tags": [],
-          "docs": "Сторона квадратной миниатюры в пикселях. По умолчанию 256.",
+          "docs": "Сторона квадратной миниатюры в DP / PT. По умолчанию 256.",
+          "complexTypes": [],
+          "type": "number | undefined"
+        },
+        {
+          "name": "density",
+          "tags": [],
+          "docs": "Множитель плотности экрана. На 3x-устройствах (iPhone Pro / Pixel)\nпередавайте `window.devicePixelRatio` (обычно 2 или 3), чтобы миниатюра\nбыла чёткой, а не размытой при апскейле.\n\nЭффективный размер на диске = `size * density`. Кеш именован\n`thumb_<id>_<size*density>.webp|jpg`.\n\nПо умолчанию `1`.",
           "complexTypes": [],
           "type": "number | undefined"
         }
@@ -572,7 +806,14 @@
         {
           "name": "size",
           "tags": [],
-          "docs": "Сторона квадратной миниатюры в пикселях. По умолчанию 256.",
+          "docs": "Сторона квадратной миниатюры в DP / PT. По умолчанию 256.",
+          "complexTypes": [],
+          "type": "number | undefined"
+        },
+        {
+          "name": "density",
+          "tags": [],
+          "docs": "Множитель плотности экрана. См. `GetThumbnailOptions.density`.",
           "complexTypes": [],
           "type": "number | undefined"
         }
@@ -781,6 +1022,73 @@
       ]
     },
     {
+      "name": "ReadFileChunkResult",
+      "slug": "readfilechunkresult",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "data",
+          "tags": [],
+          "docs": "Прочитанные байты в Base64.",
+          "complexTypes": [],
+          "type": "string"
+        },
+        {
+          "name": "bytesRead",
+          "tags": [],
+          "docs": "Реально прочитанное количество байт. Может быть меньше `length` в конце файла.",
+          "complexTypes": [],
+          "type": "number"
+        },
+        {
+          "name": "eof",
+          "tags": [],
+          "docs": "`true`, если достигли конца файла.",
+          "complexTypes": [],
+          "type": "boolean"
+        },
+        {
+          "name": "totalSize",
+          "tags": [],
+          "docs": "Полный размер файла в байтах (тот же на каждом chunk).",
+          "complexTypes": [],
+          "type": "number"
+        }
+      ]
+    },
+    {
+      "name": "ReadFileChunkOptions",
+      "slug": "readfilechunkoptions",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "id",
+          "tags": [],
+          "docs": "ID записи (`PickedFile.id`).",
+          "complexTypes": [],
+          "type": "string"
+        },
+        {
+          "name": "offset",
+          "tags": [],
+          "docs": "Смещение в файле в байтах. По умолчанию 0.",
+          "complexTypes": [],
+          "type": "number | undefined"
+        },
+        {
+          "name": "length",
+          "tags": [],
+          "docs": "Максимальное количество байт за чтение.\nПо умолчанию 1 МБ (1 048 576). Рекомендуется не превышать 4 МБ,\nиначе base64-overhead и JS-мост дают заметную задержку.",
+          "complexTypes": [],
+          "type": "number | undefined"
+        }
+      ]
+    },
+    {
       "name": "RemoveRecentFileOptions",
       "slug": "removerecentfileoptions",
       "docs": "",
@@ -793,6 +1101,40 @@
           "docs": "ID записи (`PickedFile.id`), которую нужно убрать из «недавних».",
           "complexTypes": [],
           "type": "string"
+        }
+      ]
+    },
+    {
+      "name": "PluginListenerHandle",
+      "slug": "pluginlistenerhandle",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "remove",
+          "tags": [],
+          "docs": "",
+          "complexTypes": [],
+          "type": "() => Promise<void>"
+        }
+      ]
+    },
+    {
+      "name": "MediaLibraryChangeEvent",
+      "slug": "medialibrarychangeevent",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "types",
+          "tags": [],
+          "docs": "Какие коллекции изменились. Из-за дебаунса 500ms одно событие может\nсодержать несколько типов (например, юзер удалил несколько фото и видео\nподряд).",
+          "complexTypes": [
+            "MediaLibraryChangeType"
+          ],
+          "type": "MediaLibraryChangeType[]"
         }
       ]
     }
@@ -860,6 +1202,25 @@
             "K",
             "T"
           ]
+        }
+      ]
+    },
+    {
+      "name": "MediaLibraryChangeType",
+      "slug": "medialibrarychangetype",
+      "docs": "Какой тип медиа изменился.",
+      "types": [
+        {
+          "text": "'photo'",
+          "complexTypes": []
+        },
+        {
+          "text": "'video'",
+          "complexTypes": []
+        },
+        {
+          "text": "'audio'",
+          "complexTypes": []
         }
       ]
     }

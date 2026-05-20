@@ -6,16 +6,20 @@ import android.content.SharedPreferences
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
+import android.util.Base64
 import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.InputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * FilePicker — управление «недавно выбранными» файлами.
@@ -40,6 +44,8 @@ class FilePicker(private val context: Context) {
 
     companion object {
         private const val KEY_ENTRIES = "entries"
+        private const val DEFAULT_CHUNK_BYTES = 1 * 1024 * 1024 // 1 MB
+        private const val MAX_CHUNK_BYTES = 8 * 1024 * 1024     // 8 MB (защита от OOM)
 
         private val isoFormat: SimpleDateFormat
             get() = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
@@ -195,6 +201,62 @@ class FilePicker(private val context: Context) {
             )
         } catch (_: Exception) { }
         writeAll(all)
+    }
+
+    /**
+     * Streaming-чтение фрагмента файла из «недавних».
+     *
+     * Открывает InputStream через ContentResolver (URI с persistable permission),
+     * пропускает `offset` байт, читает максимум `length`, возвращает base64.
+     * Поток закрывается сразу после чтения — никаких долгоживущих хендлов.
+     */
+    suspend fun readFileChunk(id: String, offset: Long, length: Int): JSObject = withContext(Dispatchers.IO) {
+        val entries = readAll()
+        val entry = entries.firstOrNull { it.id == id }
+            ?: throw IllegalArgumentException("Recent file not found")
+        val uri = Uri.parse(entry.uri)
+        val totalSize = entry.fileSize
+
+        val safeOffset = max(0L, offset)
+        val safeLength = if (length <= 0) DEFAULT_CHUNK_BYTES else min(length, MAX_CHUNK_BYTES)
+
+        val buf = ByteArray(safeLength)
+        var read = 0
+        val stream: InputStream = context.contentResolver.openInputStream(uri)
+            ?: throw IllegalStateException("Cannot open stream for $uri")
+        stream.use { s ->
+            // skip(offset) может вернуть меньше; повторяем.
+            var remaining = safeOffset
+            while (remaining > 0) {
+                val skipped = s.skip(remaining)
+                if (skipped <= 0) break
+                remaining -= skipped
+            }
+            // Заполняем буфер до safeLength или EOF.
+            while (read < safeLength) {
+                val n = s.read(buf, read, safeLength - read)
+                if (n <= 0) break
+                read += n
+            }
+        }
+
+        val data = if (read > 0) {
+            Base64.encodeToString(buf, 0, read, Base64.NO_WRAP)
+        } else ""
+
+        val eof: Boolean = if (totalSize > 0) {
+            safeOffset + read >= totalSize
+        } else {
+            // Если totalSize неизвестен — определяем по факту короткого чтения.
+            read < safeLength
+        }
+
+        JSObject().apply {
+            put("data", data)
+            put("bytesRead", read)
+            put("eof", eof)
+            put("totalSize", totalSize)
+        }
     }
 
     /**

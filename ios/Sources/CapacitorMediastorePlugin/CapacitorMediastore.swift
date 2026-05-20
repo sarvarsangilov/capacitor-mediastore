@@ -2,24 +2,31 @@ import Foundation
 import Photos
 import MediaPlayer
 import UIKit
+import UniformTypeIdentifiers
 
 /**
  * CapacitorMediastore — бизнес-логика iOS-плагина.
  *
  * Источники данных:
  *  - Photos framework (`PHAsset`, `PHAssetCollection`) — фото и видео.
- *  - MediaPlayer (`MPMediaQuery`, `MPMediaItem`) — аудио / музыка из системной
- *    музыкальной библиотеки. Требует `NSAppleMusicUsageDescription` в Info.plist.
+ *  - MediaPlayer (`MPMediaQuery`, `MPMediaItem`) — аудио / музыка.
+ *    Требует `NSAppleMusicUsageDescription` в Info.plist.
  *
- * Все тяжёлые операции вызываются с background-очередей через bridge-плагин.
+ * Архитектурные принципы:
+ *  - Никаких `DispatchSemaphore.wait()` — всё на completion handlers, чтобы
+ *    не блокировать поток GCD и не получать starvation на медленном iCloud.
+ *  - Cancellation через `PHImageManager.cancelImageRequest` для каждого
+ *    in-flight requestID (см. [cancelPendingThumbnails]).
+ *  - В `getMedia` НЕ резолвим тяжёлый webPath (это экспорт через
+ *    `requestContentEditingInput` / `requestAVAsset`) — он берётся лениво
+ *    через [resolveMediaPath] в момент открытия файла.
  */
 @objc public class CapacitorMediastore: NSObject {
 
-    /** Один экземпляр кеширующего менеджера на класс — заметно быстрее, чем создавать на каждый вызов. */
     private let cachingImageManager = PHCachingImageManager()
 
-    /** Базовый размер квадратной миниатюры по умолчанию. */
     private static let defaultThumbSize: Int = 256
+    private static let thumbnailJPEGQuality: CGFloat = 0.75
 
     /** Папка для кешированных миниатюр — Caches/, чтобы система могла удалять при нехватке места. */
     private lazy var thumbDir: URL = {
@@ -31,6 +38,39 @@ import UIKit
         }
         return dir
     }()
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Pending thumbnail requests — для отмены через cancelPendingThumbnails.
+    // ────────────────────────────────────────────────────────────────────────
+
+    private let pendingLock = NSLock()
+    private var pendingRequestIDs = Set<PHImageRequestID>()
+    private var cachedAssetIdsForPrefetch: [PHAsset] = []
+
+    private func addPending(_ rid: PHImageRequestID) {
+        pendingLock.lock(); pendingRequestIDs.insert(rid); pendingLock.unlock()
+    }
+
+    private func removePending(_ rid: PHImageRequestID) {
+        pendingLock.lock(); pendingRequestIDs.remove(rid); pendingLock.unlock()
+    }
+
+    @objc public func cancelPendingThumbnails() {
+        pendingLock.lock()
+        let toCancel = pendingRequestIDs
+        pendingRequestIDs.removeAll()
+        let cached = cachedAssetIdsForPrefetch
+        cachedAssetIdsForPrefetch = []
+        pendingLock.unlock()
+
+        for rid in toCancel {
+            cachingImageManager.cancelImageRequest(rid)
+        }
+        if !cached.isEmpty {
+            let size = CGSize(width: Self.defaultThumbSize, height: Self.defaultThumbSize)
+            cachingImageManager.stopCachingImages(for: cached, targetSize: size, contentMode: .aspectFill, options: nil)
+        }
+    }
 
     // MARK: - Permissions
 
@@ -94,6 +134,35 @@ import UIKit
         }
     }
 
+    // MARK: - hasMedia (cheap check)
+
+    @objc public func hasMedia(type: String, completion: @escaping (Bool) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            switch type {
+            case "audio":
+                let q = MPMediaQuery.songs()
+                completion((q.items?.count ?? 0) > 0)
+            case "photo", "video", "all":
+                let opts = PHFetchOptions()
+                opts.fetchLimit = 1
+                if type == "photo" {
+                    opts.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
+                } else if type == "video" {
+                    opts.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
+                } else {
+                    opts.predicate = NSPredicate(
+                        format: "mediaType == %d OR mediaType == %d",
+                        PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue
+                    )
+                }
+                let r = PHAsset.fetchAssets(with: opts)
+                completion(r.count > 0)
+            default:
+                completion(false)
+            }
+        }
+    }
+
     // MARK: - Albums
 
     @objc public func getAlbums(completion: @escaping ([[String: Any]]) -> Void) {
@@ -145,32 +214,27 @@ import UIKit
                 guard assetCount > 0 else { group.leave(); return }
 
                 var coverUri: String? = nil
-                var coverThumbnailWebPath: String? = nil
-                let innerGroup = DispatchGroup()
-                var coverWebPath: String? = nil
-
                 if let firstAsset = assets.firstObject {
                     coverUri = "ph://\(firstAsset.localIdentifier)"
-                    innerGroup.enter()
-                    self.resolveWebPath(for: firstAsset) { path in
-                        coverWebPath = path
-                        innerGroup.leave()
+
+                    // Резолвим coverThumbnailWebPath асинхронно.
+                    self.getOrCreateThumbnailFile(asset: firstAsset, targetSize: thumbSize) { thumbPath in
+                        let album: [String: Any] = [
+                            "id": collection.localIdentifier,
+                            "title": collection.localizedTitle ?? "Untitled",
+                            "count": assetCount,
+                            "coverUri": coverUri ?? NSNull(),
+                            // Альбомы не резолвим cover на full size — это слишком дорого.
+                            // UI получает coverThumbnailWebPath, этого достаточно для grid'а.
+                            "coverWebPath": NSNull(),
+                            "coverThumbnailWebPath": thumbPath ?? NSNull()
+                        ]
+                        lock.lock(); albums[i] = album; lock.unlock()
+                        group.leave()
                     }
-                    coverThumbnailWebPath = self.getOrCreateThumbnailFile(asset: firstAsset, targetSize: thumbSize)
+                } else {
+                    group.leave()
                 }
-                innerGroup.wait()
-
-                let album: [String: Any] = [
-                    "id": collection.localIdentifier,
-                    "title": collection.localizedTitle ?? "Untitled",
-                    "count": assetCount,
-                    "coverUri": coverUri ?? NSNull(),
-                    "coverWebPath": coverWebPath ?? NSNull(),
-                    "coverThumbnailWebPath": coverThumbnailWebPath ?? NSNull()
-                ]
-
-                lock.lock(); albums[i] = album; lock.unlock()
-                group.leave()
             }
         }
 
@@ -184,45 +248,67 @@ import UIKit
         }
     }
 
-    // MARK: - Media
+    // MARK: - Media (offset + cursor pagination)
 
     @objc public func getMedia(
         albumId: String?,
         limit: Int,
         offset: Int,
         type: String,
+        cursor: String?,
         completion: @escaping ([String: Any]) -> Void
     ) {
         if type == "audio" {
-            getAudio(limit: limit, offset: offset, completion: completion)
+            getAudio(limit: limit, offset: offset, cursor: cursor, completion: completion)
             return
         }
-        getPhotosVideos(albumId: albumId, limit: limit, offset: offset, type: type, completion: completion)
+        getPhotosVideos(
+            albumId: albumId, limit: limit, offset: offset, type: type,
+            cursor: cursor, completion: completion
+        )
     }
 
-    /**
-     * Photo/Video через Photos framework.
-     */
     private func getPhotosVideos(
         albumId: String?,
         limit: Int,
         offset: Int,
         type: String,
+        cursor: String?,
         completion: @escaping ([String: Any]) -> Void
     ) {
         let fetchOptions = PHFetchOptions()
-        fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        fetchOptions.sortDescriptors = [
+            NSSortDescriptor(key: "creationDate", ascending: false),
+            NSSortDescriptor(key: "localIdentifier", ascending: false)
+        ]
 
+        // Type predicate
+        let typePred: NSPredicate
         switch type {
         case "photo":
-            fetchOptions.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
+            typePred = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
         case "video":
-            fetchOptions.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
+            typePred = NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
         default:
-            fetchOptions.predicate = NSPredicate(
+            typePred = NSPredicate(
                 format: "mediaType == %d OR mediaType == %d",
                 PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue
             )
+        }
+
+        let cursorPos: CursorPosition? = (cursor?.isEmpty == false) ? Self.decodeCursor(cursor!) : nil
+        var predicates: [NSPredicate] = [typePred]
+        if let cur = cursorPos {
+            predicates.append(NSPredicate(
+                format: "creationDate < %@",
+                Date(timeIntervalSince1970: cur.timestamp) as NSDate
+            ))
+        }
+        fetchOptions.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: predicates)
+
+        // Если есть cursor — limit'им на уровне fetchLimit. Иначе берём offset+limit.
+        if cursorPos != nil {
+            fetchOptions.fetchLimit = limit
         }
 
         let fetchResult: PHFetchResult<PHAsset>
@@ -231,114 +317,188 @@ import UIKit
             if let collection = collections.firstObject {
                 fetchResult = PHAsset.fetchAssets(in: collection, options: fetchOptions)
             } else {
-                completion(["media": [], "total": 0, "hasMore": false]); return
+                completion(["media": [], "total": 0, "hasMore": false, "nextCursor": NSNull()]); return
             }
         } else {
             fetchResult = PHAsset.fetchAssets(with: fetchOptions)
         }
 
-        let total = fetchResult.count
-        let safeOffset = min(offset, total)
-        let safeLimit = min(limit, total - safeOffset)
-        let hasMore = safeOffset + safeLimit < total
+        // For cursor mode total ≠ count (мы не считаем все элементы). Для UI достаточно
+        // знать total один раз — отдадим count только в offset-режиме.
+        let total: Int = (cursorPos != nil) ? -1 : fetchResult.count
+
+        let safeOffset: Int
+        let safeLimit: Int
+        if cursorPos != nil {
+            safeOffset = 0
+            safeLimit = min(limit, fetchResult.count)
+        } else {
+            safeOffset = min(offset, fetchResult.count)
+            safeLimit = min(limit, fetchResult.count - safeOffset)
+        }
 
         guard safeLimit > 0 else {
-            completion(["media": [], "total": total, "hasMore": hasMore]); return
+            completion([
+                "media": [],
+                "total": total == -1 ? 0 : total,
+                "hasMore": false,
+                "nextCursor": NSNull()
+            ])
+            return
         }
 
         var items: [Int: [String: Any]] = [:]
-        let lock = NSLock()
-        let group = DispatchGroup()
-        let queue = DispatchQueue(label: "com.sangulov.plugins.mediastore.processing", attributes: .concurrent)
         let range = safeOffset..<(safeOffset + safeLimit)
 
         for i in range {
             guard i < fetchResult.count else { break }
             let asset = fetchResult.object(at: i)
             let index = i - safeOffset
+            // НЕ резолвим webPath здесь — это дорого. Клиент сам вызовет resolveMediaPath
+            // когда юзер откроет файл.
+            items[index] = assetToItem(asset: asset)
+        }
 
-            group.enter()
-            queue.async {
-                var item = self.assetToItem(asset: asset)
-                self.resolveWebPath(for: asset) { webPath in
-                    item["webPath"] = webPath ?? NSNull()
-                    lock.lock(); items[index] = item; lock.unlock()
-                    group.leave()
+        var sortedItems: [[String: Any]] = []
+        for i in 0..<safeLimit {
+            if let it = items[i] { sortedItems.append(it) }
+        }
+
+        // nextCursor + hasMore
+        var nextCursor: String? = nil
+        var hasMore: Bool
+        if cursorPos != nil {
+            // cursor-режим: nextCursor = creationDate последнего элемента.
+            if let lastAsset = (safeOffset + safeLimit - 1 < fetchResult.count)
+                ? fetchResult.object(at: safeOffset + safeLimit - 1) : nil,
+                let lastDate = lastAsset.creationDate,
+                sortedItems.count == limit {
+                nextCursor = Self.encodeCursor(CursorPosition(timestamp: lastDate.timeIntervalSince1970))
+                hasMore = true
+            } else {
+                hasMore = false
+            }
+        } else {
+            hasMore = safeOffset + safeLimit < (total == -1 ? 0 : total)
+            if hasMore {
+                if let lastAsset = (safeOffset + safeLimit - 1 < fetchResult.count)
+                    ? fetchResult.object(at: safeOffset + safeLimit - 1) : nil,
+                    let lastDate = lastAsset.creationDate {
+                    nextCursor = Self.encodeCursor(CursorPosition(timestamp: lastDate.timeIntervalSince1970))
                 }
             }
         }
 
-        group.notify(queue: .global(qos: .userInitiated)) {
-            var sortedItems: [[String: Any]] = []
-            for i in 0..<safeLimit {
-                lock.lock(); let item = items[i]; lock.unlock()
-                if let it = item { sortedItems.append(it) }
-            }
-            completion(["media": sortedItems, "total": total, "hasMore": hasMore])
-        }
+        completion([
+            "media": sortedItems,
+            "total": total == -1 ? 0 : total,
+            "hasMore": hasMore,
+            "nextCursor": nextCursor ?? NSNull()
+        ])
     }
 
     /**
-     * Audio через MPMediaQuery. Возвращает песни из системной библиотеки,
-     * отсортированные по дате добавления (`dateAdded`). Tracks из облака
-     * (Apple Music без локального файла) включаются с пустым `webPath`.
+     * Audio через MPMediaQuery, отсортированное по dateAdded DESC.
+     * Поддерживает cursor через timestamp dateAdded.
      */
     private func getAudio(
         limit: Int,
         offset: Int,
+        cursor: String?,
         completion: @escaping ([String: Any]) -> Void
     ) {
         let query = MPMediaQuery.songs()
-        guard let items = query.items, !items.isEmpty else {
-            completion(["media": [], "total": 0, "hasMore": false]); return
-        }
-        // dateAdded доступен с iOS 10+ — сортируем DESC.
-        let sorted = items.sorted { (a, b) -> Bool in
-            return a.dateAdded > b.dateAdded
+        guard var items = query.items, !items.isEmpty else {
+            completion(["media": [], "total": 0, "hasMore": false, "nextCursor": NSNull()]); return
         }
 
-        let total = sorted.count
-        let safeOffset = min(offset, total)
+        items.sort { a, b in a.dateAdded > b.dateAdded }
+
+        let cursorPos = (cursor?.isEmpty == false) ? Self.decodeCursor(cursor!) : nil
+        if let cur = cursorPos {
+            let cutoff = Date(timeIntervalSince1970: cur.timestamp)
+            items = items.filter { $0.dateAdded < cutoff }
+        }
+
+        let total = items.count
+        let safeOffset = (cursorPos != nil) ? 0 : min(offset, total)
         let safeLimit = min(limit, total - safeOffset)
-        let hasMore = safeOffset + safeLimit < total
 
         guard safeLimit > 0 else {
-            completion(["media": [], "total": total, "hasMore": hasMore]); return
+            completion(["media": [], "total": total, "hasMore": false, "nextCursor": NSNull()]); return
         }
 
-        let slice = Array(sorted[safeOffset..<(safeOffset + safeLimit)])
+        let slice = Array(items[safeOffset..<(safeOffset + safeLimit)])
         let media = slice.map { audioItemToDictionary($0) }
-        completion(["media": media, "total": total, "hasMore": hasMore])
+        let hasMore = safeOffset + safeLimit < total
+
+        var nextCursor: String? = nil
+        if hasMore || cursorPos != nil, let lastItem = slice.last {
+            nextCursor = Self.encodeCursor(CursorPosition(timestamp: lastItem.dateAdded.timeIntervalSince1970))
+        }
+
+        completion([
+            "media": media,
+            "total": total,
+            "hasMore": hasMore,
+            "nextCursor": nextCursor ?? NSNull()
+        ])
     }
 
-    // ────────────────────────────────────────────────────────────────────────
-    // Thumbnails (Lazy Load)
-    // ────────────────────────────────────────────────────────────────────────
+    // MARK: - Resolve full-size webPath (lazy)
+
+    @objc public func resolveMediaPath(id: String, completion: @escaping ([String: Any]) -> Void) {
+        // Сначала пробуем как photo/video.
+        let photoFetch = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil)
+        if let asset = photoFetch.firstObject {
+            resolveWebPath(for: asset) { webPath in
+                completion([
+                    "uri": "ph://\(asset.localIdentifier)",
+                    "webPath": webPath ?? NSNull()
+                ])
+            }
+            return
+        }
+        // Audio?
+        if let audioItem = audioItemByPersistentId(id) {
+            let uri = audioItem.assetURL?.absoluteString ?? ""
+            let webPath: Any = audioItem.assetURL.flatMap {
+                "capacitor://localhost/_capacitor_file_" + $0.path
+            } ?? NSNull()
+            completion(["uri": uri, "webPath": webPath])
+            return
+        }
+        completion(["uri": "", "webPath": NSNull()])
+    }
+
+    // MARK: - Thumbnails (Lazy Load, async callbacks)
 
     @objc public func getThumbnail(
         id: String,
         returnBase64: Bool,
         size: Int,
+        density: Double,
         completion: @escaping ([String: Any]) -> Void
     ) {
-        let dim = size > 0 ? size : Self.defaultThumbSize
+        let dim = effectiveThumbDim(size: size, density: density)
         let targetSize = CGSize(width: dim, height: dim)
 
-        // Сначала пробуем как photo/video.
         let photoFetch = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil)
         if let asset = photoFetch.firstObject {
-            let webPath = self.getOrCreateThumbnailFile(asset: asset, targetSize: targetSize) ?? ""
-            let b64 = (returnBase64 && !webPath.isEmpty)
-                ? self.readCachedAsBase64DataUrl(localIdentifier: asset.localIdentifier, size: dim) : ""
-            completion(["webPath": webPath, "base64String": b64])
+            getOrCreateThumbnailFile(asset: asset, targetSize: targetSize) { [weak self] webPath in
+                guard let self = self else { completion(["webPath": "", "base64String": ""]); return }
+                let path = webPath ?? ""
+                let b64 = (returnBase64 && !path.isEmpty)
+                    ? self.readCachedAsBase64DataUrl(localIdentifier: asset.localIdentifier, size: dim) : ""
+                completion(["webPath": path, "base64String": b64])
+            }
             return
         }
 
-        // Если не нашли — пробуем как audio (id = persistentID в виде строки).
         if let audioItem = audioItemByPersistentId(id) {
-            let webPath = self.getOrCreateAudioArtworkFile(item: audioItem, targetSize: targetSize) ?? ""
+            let webPath = getOrCreateAudioArtworkFile(item: audioItem, targetSize: targetSize) ?? ""
             let b64 = (returnBase64 && !webPath.isEmpty)
-                ? self.readCachedAsBase64DataUrl(rawId: "audio_\(id)", size: dim) : ""
+                ? readCachedAsBase64DataUrl(rawId: "audio_\(id)", size: dim) : ""
             completion(["webPath": webPath, "base64String": b64])
             return
         }
@@ -349,77 +509,216 @@ import UIKit
     @objc public func getThumbnails(
         ids: [String],
         size: Int,
+        density: Double,
         completion: @escaping ([String: Any]) -> Void
     ) {
-        let dim = size > 0 ? size : Self.defaultThumbSize
+        let dim = effectiveThumbDim(size: size, density: density)
         let targetSize = CGSize(width: dim, height: dim)
 
-        // Разделяем ID на photo/video и audio.
-        var phIds: [String] = []
-        var audioIds: [String] = []
+        let (phAssetsById, audioIds) = splitIdsByType(ids: ids)
 
-        let photoFetch = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
-        var phAssetsById: [String: PHAsset] = [:]
-        photoFetch.enumerateObjects { asset, _, _ in
-            phAssetsById[asset.localIdentifier] = asset
-        }
-        for id in ids {
-            if phAssetsById[id] != nil { phIds.append(id) } else { audioIds.append(id) }
-        }
-
-        let toCache: [PHAsset] = phIds.compactMap { phAssetsById[$0] }
+        // Warmup caching manager for PHAssets.
+        let toCache = phAssetsById.values.map { $0 }
         if !toCache.isEmpty {
-            cachingImageManager.startCachingImages(for: toCache, targetSize: targetSize, contentMode: .aspectFill, options: nil)
+            cachingImageManager.startCachingImages(
+                for: Array(toCache), targetSize: targetSize, contentMode: .aspectFill, options: nil
+            )
+            pendingLock.lock()
+            cachedAssetIdsForPrefetch.append(contentsOf: toCache)
+            pendingLock.unlock()
         }
 
-        let workQueue = DispatchQueue(label: "com.sangulov.plugins.mediastore.thumbnails", attributes: .concurrent)
-        let semaphore = DispatchSemaphore(value: 6)
         let group = DispatchGroup()
         let lock = NSLock()
         var thumbs: [String: String] = [:]
 
-        for rawId in phIds {
-            guard let asset = phAssetsById[rawId] else { continue }
-            group.enter()
-            workQueue.async {
-                semaphore.wait()
-                let path = self.getOrCreateThumbnailFile(asset: asset, targetSize: targetSize)
-                if let p = path, !p.isEmpty {
-                    lock.lock(); thumbs[rawId] = p; lock.unlock()
-                }
-                semaphore.signal()
-                group.leave()
-            }
-        }
-
-        for rawId in audioIds {
-            group.enter()
-            workQueue.async {
-                semaphore.wait()
-                if let item = self.audioItemByPersistentId(rawId) {
-                    let path = self.getOrCreateAudioArtworkFile(item: item, targetSize: targetSize)
+        for id in ids {
+            if let asset = phAssetsById[id] {
+                group.enter()
+                getOrCreateThumbnailFile(asset: asset, targetSize: targetSize) { path in
                     if let p = path, !p.isEmpty {
-                        lock.lock(); thumbs[rawId] = p; lock.unlock()
+                        lock.lock(); thumbs[id] = p; lock.unlock()
                     }
+                    group.leave()
                 }
-                semaphore.signal()
-                group.leave()
+            } else if audioIds.contains(id) {
+                group.enter()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    if let item = self.audioItemByPersistentId(id),
+                       let path = self.getOrCreateAudioArtworkFile(item: item, targetSize: targetSize) {
+                        lock.lock(); thumbs[id] = path; lock.unlock()
+                    }
+                    group.leave()
+                }
             }
         }
 
         group.notify(queue: .global(qos: .userInitiated)) {
+            // Cleanup caching scope.
             if !toCache.isEmpty {
                 self.cachingImageManager.stopCachingImages(
-                    for: toCache, targetSize: targetSize, contentMode: .aspectFill, options: nil
+                    for: Array(toCache), targetSize: targetSize, contentMode: .aspectFill, options: nil
                 )
+                self.pendingLock.lock()
+                self.cachedAssetIdsForPrefetch.removeAll { a in toCache.contains(a) }
+                self.pendingLock.unlock()
             }
             completion(["thumbnails": thumbs])
         }
     }
 
-    // ────────────────────────────────────────────────────────────────────────
-    // Helpers
-    // ────────────────────────────────────────────────────────────────────────
+    @objc public func prefetchThumbnails(ids: [String], size: Int, density: Double) {
+        let dim = effectiveThumbDim(size: size, density: density)
+        let targetSize = CGSize(width: dim, height: dim)
+        let (phAssetsById, audioIds) = splitIdsByType(ids: ids)
+
+        let toCache = Array(phAssetsById.values)
+        if !toCache.isEmpty {
+            cachingImageManager.startCachingImages(
+                for: toCache, targetSize: targetSize, contentMode: .aspectFill, options: nil
+            )
+            pendingLock.lock()
+            cachedAssetIdsForPrefetch.append(contentsOf: toCache)
+            pendingLock.unlock()
+        }
+
+        // Fire-and-forget background tasks для записи файлов на диск.
+        for id in ids {
+            if let asset = phAssetsById[id] {
+                getOrCreateThumbnailFile(asset: asset, targetSize: targetSize) { _ in /* discard */ }
+            } else if audioIds.contains(id) {
+                DispatchQueue.global(qos: .utility).async {
+                    if let item = self.audioItemByPersistentId(id) {
+                        _ = self.getOrCreateAudioArtworkFile(item: item, targetSize: targetSize)
+                    }
+                }
+            }
+        }
+    }
+
+    private func splitIdsByType(ids: [String]) -> (photo: [String: PHAsset], audio: Set<String>) {
+        let photoFetch = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+        var phAssetsById: [String: PHAsset] = [:]
+        photoFetch.enumerateObjects { asset, _, _ in
+            phAssetsById[asset.localIdentifier] = asset
+        }
+        let audioIds = Set(ids.filter { phAssetsById[$0] == nil })
+        return (phAssetsById, audioIds)
+    }
+
+    private func effectiveThumbDim(size: Int, density: Double) -> Int {
+        let s = size > 0 ? size : Self.defaultThumbSize
+        let d = density > 0 ? density : 1.0
+        let eff = Int((Double(s) * d).rounded())
+        return max(eff, 32)
+    }
+
+    // MARK: - Async thumbnail file generation
+
+    /**
+     * Async-вариант генерации миниатюры. Никаких semaphore.wait():
+     *  - проверяет файловый кеш → возвращает мгновенно.
+     *  - иначе шлёт requestImage с completion handler.
+     *  - в completion пишет JPEG на диск, отдаёт callback.
+     *
+     * RequestID трекается в [pendingRequestIDs] для возможности отмены.
+     */
+    private func getOrCreateThumbnailFile(
+        asset: PHAsset,
+        targetSize: CGSize,
+        completion: @escaping (String?) -> Void
+    ) {
+        let safeId = asset.localIdentifier
+            .replacingOccurrences(of: "[^A-Za-z0-9]", with: "_", options: .regularExpression)
+        let dim = Int(targetSize.width)
+        let fileURL = thumbDir.appendingPathComponent("thumb_\(safeId)_\(dim).jpg")
+
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            completion("capacitor://localhost/_capacitor_file_" + fileURL.path)
+            return
+        }
+
+        let options = PHImageRequestOptions()
+        options.isSynchronous = false
+        options.isNetworkAccessAllowed = true
+        options.resizeMode = .fast
+        options.deliveryMode = .opportunistic
+
+        var didDeliverFinal = false
+        let requestID = cachingImageManager.requestImage(
+            for: asset,
+            targetSize: targetSize,
+            contentMode: .aspectFill,
+            options: options
+        ) { [weak self] image, info in
+            guard let self = self else { return }
+            let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+            let isCancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
+            if isCancelled {
+                completion(nil)
+                return
+            }
+            if didDeliverFinal { return }
+            if isDegraded { return } // ждём финальный кадр
+            didDeliverFinal = true
+
+            // requestID trackedID: на момент callback'а у нас уже есть Int32, но он
+            // приходит как параметр первого вызова. Используем поле info или
+            // переменную захвата ниже.
+
+            if let img = image, let data = img.jpegData(compressionQuality: Self.thumbnailJPEGQuality) {
+                do {
+                    try data.write(to: fileURL)
+                    completion("capacitor://localhost/_capacitor_file_" + fileURL.path)
+                } catch {
+                    completion(nil)
+                }
+            } else {
+                completion(nil)
+            }
+        }
+        addPending(requestID)
+        // Снять с pending по завершению — нам не приходит явный сигнал, но
+        // последующая отмена не повредит, а cancelImageRequest безопасен для завершённых ID.
+        // Очистим через небольшой grace-период:
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10.0) { [weak self] in
+            self?.removePending(requestID)
+        }
+    }
+
+    private func getOrCreateAudioArtworkFile(item: MPMediaItem, targetSize: CGSize) -> String? {
+        let safeId = "audio_\(item.persistentID)"
+        let dim = Int(targetSize.width)
+        let fileURL = thumbDir.appendingPathComponent("thumb_\(safeId)_\(dim).jpg")
+
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            return "capacitor://localhost/_capacitor_file_" + fileURL.path
+        }
+        guard let image = item.artwork?.image(at: targetSize),
+              let data = image.jpegData(compressionQuality: Self.thumbnailJPEGQuality) else {
+            return nil
+        }
+        do {
+            try data.write(to: fileURL)
+            return "capacitor://localhost/_capacitor_file_" + fileURL.path
+        } catch {
+            return nil
+        }
+    }
+
+    private func readCachedAsBase64DataUrl(localIdentifier: String, size: Int) -> String {
+        let safeId = localIdentifier
+            .replacingOccurrences(of: "[^A-Za-z0-9]", with: "_", options: .regularExpression)
+        return readCachedAsBase64DataUrl(rawId: safeId, size: size)
+    }
+
+    private func readCachedAsBase64DataUrl(rawId: String, size: Int) -> String {
+        let fileURL = thumbDir.appendingPathComponent("thumb_\(rawId)_\(size).jpg")
+        guard let data = try? Data(contentsOf: fileURL) else { return "" }
+        return "data:image/jpeg;base64,\(data.base64EncodedString())"
+    }
+
+    // MARK: - Helpers
 
     private func assetToItem(asset: PHAsset) -> [String: Any] {
         let mediaType: String = asset.mediaType == .video ? "video" : "photo"
@@ -444,17 +743,25 @@ import UIKit
             if let sizeValue = resource.value(forKey: "fileSize") as? Int64 {
                 fileSize = sizeValue
             }
-            mimeType = self.mimeTypeFromUTI(resource.uniformTypeIdentifier)
+            mimeType = mimeTypeFromUTI(resource.uniformTypeIdentifier)
         }
+
+        let isLive = asset.mediaSubtypes.contains(.photoLive)
+        let isHDR = asset.mediaSubtypes.contains(.photoHDR)
 
         return [
             "id": asset.localIdentifier,
             "type": mediaType,
             "uri": uri,
+            // webPath намеренно null — резолвится лениво через resolveMediaPath.
+            "webPath": NSNull(),
             "thumbnailUri": NSNull(),
             "thumbnailWebPath": NSNull(),
             "width": asset.pixelWidth,
             "height": asset.pixelHeight,
+            "orientation": 0, // PhotoKit возвращает уже-rotation-нормализованные размеры
+            "isLivePhoto": isLive,
+            "isHDR": isHDR,
             "createdAt": createdAt,
             "duration": asset.duration,
             "mimeType": mimeType,
@@ -501,6 +808,9 @@ import UIKit
             "thumbnailWebPath": NSNull(),
             "width": 0,
             "height": 0,
+            "orientation": 0,
+            "isLivePhoto": false,
+            "isHDR": false,
             "createdAt": createdAt,
             "duration": duration,
             "mimeType": mimeType,
@@ -522,113 +832,31 @@ import UIKit
         return query.items?.first
     }
 
-    /**
-     * Сохраняет обложку аудио на диск; возвращает webPath или nil, если обложки нет.
-     */
-    private func getOrCreateAudioArtworkFile(item: MPMediaItem, targetSize: CGSize) -> String? {
-        let safeId = "audio_\(item.persistentID)"
-        let dim = Int(targetSize.width)
-        let fileURL = thumbDir.appendingPathComponent("thumb_\(safeId)_\(dim).jpg")
-
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            return "capacitor://localhost/_capacitor_file_" + fileURL.path
-        }
-
-        guard let image = item.artwork?.image(at: targetSize),
-              let data = image.jpegData(compressionQuality: 0.7) else {
-            return nil
-        }
-        do {
-            try data.write(to: fileURL)
-            return "capacitor://localhost/_capacitor_file_" + fileURL.path
-        } catch {
-            return nil
-        }
-    }
-
-    private func getOrCreateThumbnailFile(asset: PHAsset, targetSize: CGSize) -> String? {
-        let safeId = asset.localIdentifier
-            .replacingOccurrences(of: "[^A-Za-z0-9]", with: "_", options: .regularExpression)
-        let dim = Int(targetSize.width)
-        let fileURL = thumbDir.appendingPathComponent("thumb_\(safeId)_\(dim).jpg")
-
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            return "capacitor://localhost/_capacitor_file_" + fileURL.path
-        }
-
-        let options = PHImageRequestOptions()
-        options.isSynchronous = false
-        options.isNetworkAccessAllowed = true
-        options.resizeMode = .fast
-        options.deliveryMode = .opportunistic
-
-        let semaphore = DispatchSemaphore(value: 0)
-        var resultPath: String? = nil
-        var deliveredFinal = false
-
-        cachingImageManager.requestImage(
-            for: asset, targetSize: targetSize, contentMode: .aspectFill, options: options
-        ) { image, info in
-            let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
-            if deliveredFinal { return }
-            if isDegraded { return }
-            deliveredFinal = true
-            if let img = image, let data = img.jpegData(compressionQuality: 0.7) {
-                do {
-                    try data.write(to: fileURL)
-                    resultPath = "capacitor://localhost/_capacitor_file_" + fileURL.path
-                } catch { }
-            }
-            semaphore.signal()
-        }
-        _ = semaphore.wait(timeout: .now() + 5.0)
-        return resultPath
-    }
-
-    private func readCachedAsBase64DataUrl(localIdentifier: String, size: Int) -> String {
-        let safeId = localIdentifier
-            .replacingOccurrences(of: "[^A-Za-z0-9]", with: "_", options: .regularExpression)
-        return readCachedAsBase64DataUrl(rawId: safeId, size: size)
-    }
-
-    private func readCachedAsBase64DataUrl(rawId: String, size: Int) -> String {
-        let fileURL = thumbDir.appendingPathComponent("thumb_\(rawId)_\(size).jpg")
-        guard let data = try? Data(contentsOf: fileURL) else { return "" }
-        return "data:image/jpeg;base64,\(data.base64EncodedString())"
-    }
-
     private func resolveWebPath(for asset: PHAsset, completion: @escaping (String?) -> Void) {
         let options = PHContentEditingInputRequestOptions()
         options.isNetworkAccessAllowed = true
 
         asset.requestContentEditingInput(with: options) { input, _ in
-            guard let url = input?.fullSizeImageURL else {
-                if asset.mediaType == .video {
-                    let videoOptions = PHVideoRequestOptions()
-                    videoOptions.isNetworkAccessAllowed = true
-                    PHImageManager.default().requestAVAsset(forVideo: asset, options: videoOptions) { avAsset, _, _ in
-                        if let urlAsset = avAsset as? AVURLAsset {
-                            completion(self.convertToCapacitorPath(url: urlAsset.url))
-                        } else {
-                            completion(nil)
-                        }
-                    }
-                    return
-                }
-                completion(nil)
+            if let url = input?.fullSizeImageURL {
+                completion("capacitor://localhost/_capacitor_file_" + url.path)
                 return
             }
-            completion(self.convertToCapacitorPath(url: url))
+            if asset.mediaType == .video {
+                let videoOptions = PHVideoRequestOptions()
+                videoOptions.isNetworkAccessAllowed = true
+                PHImageManager.default().requestAVAsset(forVideo: asset, options: videoOptions) { avAsset, _, _ in
+                    if let urlAsset = avAsset as? AVURLAsset {
+                        completion("capacitor://localhost/_capacitor_file_" + urlAsset.url.path)
+                    } else {
+                        completion(nil)
+                    }
+                }
+                return
+            }
+            completion(nil)
         }
     }
 
-    private func convertToCapacitorPath(url: URL) -> String {
-        return "capacitor://localhost/_capacitor_file_" + url.path
-    }
-
-    /**
-     * Конвертирует UTI (Uniform Type Identifier) либо расширение файла в MIME-тип.
-     */
     private func mimeTypeFromUTI(_ utiOrExt: String) -> String {
         let map: [String: String] = [
             "public.jpeg": "image/jpeg",
@@ -648,11 +876,34 @@ import UIKit
         ]
         if let m = map[utiOrExt] { return m }
         if #available(iOS 14.0, *) {
-            if let t = UniformTypeIdentifiers.UTType(filenameExtension: utiOrExt),
+            if let t = UTType(filenameExtension: utiOrExt),
+               let m = t.preferredMIMEType {
+                return m
+            }
+            if let t = UTType(utiOrExt),
                let m = t.preferredMIMEType {
                 return m
             }
         }
         return "application/octet-stream"
+    }
+
+    // MARK: - Cursor encoding
+
+    private struct CursorPosition {
+        let timestamp: TimeInterval
+    }
+
+    private static func encodeCursor(_ pos: CursorPosition) -> String {
+        let raw = "\(pos.timestamp)"
+        guard let data = raw.data(using: .utf8) else { return "" }
+        return data.base64EncodedString()
+    }
+
+    private static func decodeCursor(_ token: String) -> CursorPosition? {
+        guard let data = Data(base64Encoded: token),
+              let raw = String(data: data, encoding: .utf8),
+              let ts = TimeInterval(raw) else { return nil }
+        return CursorPosition(timestamp: ts)
     }
 }

@@ -20,6 +20,12 @@ import type {
   ResolveRecentFileOptions,
   ResolveRecentFileResult,
   PickedFile,
+  HasMediaOptions,
+  HasMediaResult,
+  ResolveMediaPathOptions,
+  ResolveMediaPathResult,
+  ReadFileChunkOptions,
+  ReadFileChunkResult,
 } from './definitions';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -32,7 +38,6 @@ import type {
 
 const STORE_KEY = 'capacitor-mediastore-web-recent';
 
-/** Генерирует ISO-дату, сдвинутую на `daysAgo` дней назад. */
 function fakeDate(daysAgo: number): string {
   const d = new Date();
   d.setDate(d.getDate() - daysAgo);
@@ -89,6 +94,9 @@ function generateMockMedia(count: number): MediaItem[] {
       thumbnailWebPath: null,
       width: isVideo ? 1920 : 1080,
       height: isVideo ? 1080 : 1920,
+      orientation: 0,
+      isLivePhoto: !isVideo && i % 7 === 0,
+      isHDR: !isVideo && i % 11 === 0,
       createdAt: fakeDate(i),
       duration: isVideo ? 15 + (i % 120) : 0,
       mimeType: isVideo ? 'video/mp4' : 'image/jpeg',
@@ -112,6 +120,9 @@ function generateMockAudio(count: number): MediaItem[] {
       thumbnailWebPath: null,
       width: 0,
       height: 0,
+      orientation: 0,
+      isLivePhoto: false,
+      isHDR: false,
       createdAt: fakeDate(i),
       duration: 120 + (i % 240),
       mimeType: 'audio/mpeg',
@@ -147,6 +158,9 @@ function writeRecentStore(items: PickedFile[]): void {
   }
 }
 
+/** Хранилище Blob'ов для readFileChunk (память сессии, не персистится). */
+const sessionBlobs: Map<string, Blob> = new Map();
+
 function matchesMime(mime: string, pattern: string): boolean {
   if (pattern === '*/*') return true;
   if (pattern.endsWith('/*')) {
@@ -154,6 +168,10 @@ function matchesMime(mime: string, pattern: string): boolean {
     return mime.toLowerCase().startsWith(`${prefix}/`);
   }
   return mime.toLowerCase() === pattern.toLowerCase();
+}
+
+function timestampOf(item: MediaItem): number {
+  return new Date(item.createdAt).getTime();
 }
 
 export class CapacitorMediastoreWeb extends WebPlugin implements CapacitorMediastorePlugin {
@@ -176,40 +194,74 @@ export class CapacitorMediastoreWeb extends WebPlugin implements CapacitorMedias
   // ── Media ────────────────────────────────────────────────────────────────
 
   async getMedia(options: GetMediaOptions): Promise<GetMediaResult> {
-    const { limit, offset, type } = options;
+    const { limit, offset, type, cursor } = options;
 
     let filtered: MediaItem[];
     if (type === 'audio') {
       filtered = MOCK_AUDIO;
     } else if (type === 'all') {
-      filtered = MOCK_MEDIA; // photo + video, без audio (как на нативных платформах)
+      filtered = MOCK_MEDIA;
     } else {
       filtered = MOCK_MEDIA.filter((m) => m.type === type);
     }
 
-    const total = filtered.length;
-    const sliced = filtered.slice(offset, offset + limit);
-    const hasMore = offset + limit < total;
+    // Cursor-режим: фильтруем по timestamp < cursor.
+    if (cursor) {
+      const cursorTs = parseInt(atob(cursor), 10);
+      filtered = filtered.filter((m) => timestampOf(m) < cursorTs);
+    }
 
-    return { media: sliced, total, hasMore };
+    const total = filtered.length;
+    const safeOffset = cursor ? 0 : offset;
+    const sliced = filtered.slice(safeOffset, safeOffset + limit);
+    const hasMore = safeOffset + limit < total;
+    const lastItem = sliced[sliced.length - 1];
+    const nextCursor = hasMore && lastItem ? btoa(`${timestampOf(lastItem)}`) : null;
+
+    return { media: sliced, total, hasMore, nextCursor };
+  }
+
+  async hasMedia(options: HasMediaOptions): Promise<HasMediaResult> {
+    if (options.type === 'audio') return { available: MOCK_AUDIO.length > 0 };
+    if (options.type === 'all') return { available: MOCK_MEDIA.length > 0 };
+    return { available: MOCK_MEDIA.some((m) => m.type === options.type) };
+  }
+
+  async resolveMediaPath(options: ResolveMediaPathOptions): Promise<ResolveMediaPathResult> {
+    const all = [...MOCK_MEDIA, ...MOCK_AUDIO];
+    const found = all.find((m) => m.id === options.id);
+    if (!found) return { uri: '', webPath: null };
+    return { uri: found.uri, webPath: found.webPath };
   }
 
   // ── Lazy Thumbnails ──────────────────────────────────────────────────────
 
   async getThumbnail(options: GetThumbnailOptions): Promise<GetThumbnailResult> {
     const size = options.size ?? 256;
-    const webPath = mockThumbWebPath(options.id, size);
+    const density = options.density ?? 1;
+    const effective = Math.round(size * density);
+    const webPath = mockThumbWebPath(options.id, effective);
     const base64String = options.returnBase64 ? MOCK_BASE64 : '';
     return { webPath, base64String };
   }
 
   async getThumbnails(options: GetThumbnailsOptions): Promise<GetThumbnailsResult> {
     const size = options.size ?? 256;
+    const density = options.density ?? 1;
+    const effective = Math.round(size * density);
     const thumbnails: Record<string, string> = {};
     for (const id of options.ids) {
-      thumbnails[id] = mockThumbWebPath(id, size);
+      thumbnails[id] = mockThumbWebPath(id, effective);
     }
     return { thumbnails };
+  }
+
+  async prefetchThumbnails(_options: GetThumbnailsOptions): Promise<void> {
+    // На web — no-op (браузер сам кеширует HTTP-картинки).
+  }
+
+  async cancelPendingThumbnails(): Promise<void> {
+    // На web — no-op (нет долгих in-flight операций).
   }
 
   // ── File picker / Recent files ───────────────────────────────────────────
@@ -234,6 +286,7 @@ export class CapacitorMediastoreWeb extends WebPlugin implements CapacitorMedias
         const picked: PickedFile[] = files.map((file) => {
           const url = URL.createObjectURL(file);
           const id = `web-${now}-${file.name}`;
+          sessionBlobs.set(id, file);
           return {
             id,
             uri: url,
@@ -246,7 +299,6 @@ export class CapacitorMediastoreWeb extends WebPlugin implements CapacitorMedias
           };
         });
 
-        // Удаляем дубли по fileName + size и кладём новые в начало.
         const filteredStore = store.filter(
           (s) => !picked.some((p) => p.fileName === s.fileName && p.fileSize === s.fileSize),
         );
@@ -256,8 +308,6 @@ export class CapacitorMediastoreWeb extends WebPlugin implements CapacitorMedias
         resolve({ files: picked });
       };
 
-      // На случай отмены — нет надёжного события, поэтому в браузерной mock-версии
-      // отмена не отдаётся в плагин. На нативных платформах это работает корректно.
       document.body.appendChild(input);
       input.click();
     });
@@ -286,12 +336,37 @@ export class CapacitorMediastoreWeb extends WebPlugin implements CapacitorMedias
     return { file: updated };
   }
 
+  async readFileChunk(options: ReadFileChunkOptions): Promise<ReadFileChunkResult> {
+    const blob = sessionBlobs.get(options.id);
+    if (!blob) {
+      // Заметка: на веб blob теряется при перезагрузке страницы — это
+      // ограничение браузера (ObjectURL не персистится). На нативе всё ок.
+      return { data: '', bytesRead: 0, eof: true, totalSize: 0 };
+    }
+    const offset = options.offset ?? 0;
+    const length = options.length ?? 1_048_576;
+    const slice = blob.slice(offset, offset + length);
+    const buffer = await slice.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    // btoa требует string; chunk-encode для больших буферов.
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return {
+      data: btoa(binary),
+      bytesRead: bytes.length,
+      eof: offset + bytes.length >= blob.size,
+      totalSize: blob.size,
+    };
+  }
+
   async removeRecentFile(options: RemoveRecentFileOptions): Promise<void> {
     const all = readRecentStore();
     writeRecentStore(all.filter((f) => f.id !== options.id));
+    sessionBlobs.delete(options.id);
   }
 
   async clearRecentFiles(): Promise<void> {
     writeRecentStore([]);
+    sessionBlobs.clear();
   }
 }

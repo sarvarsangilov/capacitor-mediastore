@@ -51,6 +51,9 @@ final class FilePicker: NSObject {
         return f
     }()
 
+    private static let defaultChunkBytes = 1 * 1024 * 1024 // 1 MB
+    private static let maxChunkBytes = 8 * 1024 * 1024     // 8 MB
+
     // ────────────────────────────────────────────────────────────────────────
     // Public API
     // ────────────────────────────────────────────────────────────────────────
@@ -212,6 +215,58 @@ final class FilePicker: NSObject {
         queue.async {
             self.writeAll([])
             completion()
+        }
+    }
+
+    /**
+     * Streaming-чтение фрагмента файла. Резолвит bookmark, открывает FileHandle,
+     * читает чанк под security-scoped access. Хендл закрывается после чтения.
+     */
+    func readFileChunk(id: String, offset: Int64, length: Int, completion: @escaping ([String: Any]?) -> Void) {
+        queue.async {
+            let all = self.readAll()
+            guard let entry = all.first(where: { $0.id == id }) else { completion(nil); return }
+            guard let resolved = self.resolveBookmark(entry: entry) else { completion(nil); return }
+            guard let url = URL(string: resolved.uri) else { completion(nil); return }
+
+            let didStart = url.startAccessingSecurityScopedResource()
+            defer { if didStart { url.stopAccessingSecurityScopedResource() } }
+
+            let safeOffset = max(0, offset)
+            let safeLength = length <= 0 ? Self.defaultChunkBytes : min(length, Self.maxChunkBytes)
+
+            do {
+                let handle = try FileHandle(forReadingFrom: url)
+                defer { try? handle.close() }
+
+                if #available(iOS 13.4, *) {
+                    try handle.seek(toOffset: UInt64(safeOffset))
+                } else {
+                    handle.seek(toFileOffset: UInt64(safeOffset))
+                }
+
+                var data: Data
+                if #available(iOS 13.4, *) {
+                    data = (try handle.read(upToCount: safeLength)) ?? Data()
+                } else {
+                    data = handle.readData(ofLength: safeLength)
+                }
+
+                let totalSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? resolved.fileSize
+                let bytesRead = data.count
+                let eof: Bool = totalSize > 0
+                    ? (safeOffset + Int64(bytesRead) >= totalSize)
+                    : (bytesRead < safeLength)
+
+                completion([
+                    "data": data.base64EncodedString(),
+                    "bytesRead": bytesRead,
+                    "eof": eof,
+                    "totalSize": totalSize
+                ])
+            } catch {
+                completion(nil)
+            }
         }
     }
 
